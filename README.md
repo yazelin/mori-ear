@@ -43,11 +43,19 @@ cargo install --path .
 # 3. 背景跑 —— 開 PowerShell 用 Start-Process,或直接 double-click .exe
 Start-Process mori-ear -WindowStyle Hidden
 
+# 4. clone repo 後安裝成 Windows 登入後自動啟動:
+powershell -ExecutionPolicy Bypass -File .\scripts\install-autostart.ps1
+
+# 5. clone repo 後移除自動啟動:
+powershell -ExecutionPolicy Bypass -File .\scripts\remove-autostart.ps1
+
 # 如果是下載 GitHub Actions 的 mori-ear-windows-x86_64 artifact:
 # 先解壓 mori-ear-windows-x86_64.zip,再在 mori-ear.exe 所在資料夾跑:
 Start-Process .\mori-ear.exe -WindowStyle Hidden
+powershell -ExecutionPolicy Bypass -File .\install-autostart.ps1
+powershell -ExecutionPolicy Bypass -File .\remove-autostart.ps1
 
-# 4. 任何視窗按住 Ctrl+Alt+E 講話、放開 → 字會貼進焦點視窗
+# 任何視窗按住 Ctrl+Alt+E 講話、放開 → 字會貼進焦點視窗
 ```
 
 Windows 不用裝 xclip / xdotool —— clipboard + Ctrl+V 走 Win32 API,進程式內部。Terminal(Windows Terminal、mintty、alacritty 等)自動切 Ctrl+Shift+V。

@@ -1,0 +1,57 @@
+[package]
+name = "mori-ear"
+version = "0.1.0"
+edition = "2021"
+description = "Mori 的耳朵 — 極簡 CLI:全域熱鍵 → 錄音 → STT → stdout"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# audio capture
+cpal = "0.15"
+# WAV encoding (Groq Whisper 收 wav/mp3/flac 等,wav 最簡)
+hound = "3.5"
+# Groq Whisper API
+reqwest = { version = "0.12", features = ["multipart", "rustls-tls", "json"], default-features = false }
+# async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+# global hotkey(MVP:Linux X11 + Windows;Wayland 之後加 ashpd)
+global-hotkey = "0.6"
+# paste-back:type 進焦點視窗。enigo 跨 Linux X11 / Windows / macOS,Unicode OK
+enigo = "0.5"
+# 單一實例 lock(Linux 用 abstract socket、Windows 用 named mutex、macOS lock file)
+# 避免兩個 mori-ear 同時 grab 同一把熱鍵(X11 一個 client 一把 key)
+single-instance = "0.3"
+# JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# error + log
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# parking_lot for low-overhead mutex(audio callback path)
+parking_lot = "0.12"
+
+# Windows-only:跟 mori-desktop 同一套,paste-back 改走 Win32 clipboard + SendInput Ctrl+V
+# (比 enigo text() 逐字 SCANCODE_UNICODE 快很多,長段落瞬間貼上)。
+#   - Win32_Foundation: HWND / HANDLE / CloseHandle
+#   - Win32_UI_Input_KeyboardAndMouse: SendInput / VK_CONTROL / VK_V 注入 Ctrl+V
+#   - Win32_UI_WindowsAndMessaging: GetForegroundWindow / GetWindowThreadProcessId
+#   - Win32_System_Threading: OpenProcess / QueryFullProcessImageNameW(取焦點視窗 process name → 偵測 terminal)
+#   - Win32_System_DataExchange: OpenClipboard / SetClipboardData / EmptyClipboard / CloseClipboard
+#   - Win32_System_Memory: GlobalAlloc / GlobalLock / GlobalUnlock(clipboard buffer 必經)
+#   - Win32_System_Ole: CF_UNICODETEXT 常數
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

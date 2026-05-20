@@ -60,16 +60,25 @@ fn default_hotkey() -> String {
 }
 
 impl Config {
+    /// 兩層 merge:`~/.mori/ear.json` 提供覆寫,`~/.mori/config.json` 補洞。
+    ///
+    /// 過去版本是「ear.json 存在 → 整份用它,完全不 fallback」,結果只想用 ear.json
+    /// 改 hotkey 的 user(沒寫 groq_api_key 欄位)會被當成 key 沒設,啟動直接死在
+    /// 「GROQ_API_KEY 缺」 — 即使 config.json 早就有跟 mori-desktop 共用那把 key。
+    /// 改成 partial merge:ear.json 沒寫 / 空字串的 groq_api_key 自動補 config.json
+    /// 的 `providers.groq.api_key`。
     fn load() -> Self {
-        // 順序:~/.mori/ear.json > ~/.mori/config.json (整份共用) > 預設
-        let cfg = Self::try_load_path(&ear_config_path())
-            .or_else(|| Self::try_load_path_field(&mori_config_path()))
-            .unwrap_or_else(|| Self {
-                hotkey: default_hotkey(),
-                groq_api_key: String::new(),
-                language: String::new(),
-                raw: false,
-            });
+        let mut cfg = Self::try_load_path(&ear_config_path()).unwrap_or_else(|| Self {
+            hotkey: default_hotkey(),
+            groq_api_key: String::new(),
+            language: String::new(),
+            raw: false,
+        });
+        if cfg.groq_api_key.is_empty() {
+            if let Some(k) = Self::try_load_groq_key_from_mori(&mori_config_path()) {
+                cfg.groq_api_key = k;
+            }
+        }
         cfg
     }
 
@@ -78,23 +87,15 @@ impl Config {
         serde_json::from_str(&text).ok()
     }
 
-    /// 從 ~/.mori/config.json 撈 providers.groq.api_key(跟 mori-desktop 同一份)。
-    /// 之後可加 ~/.mori/ear.json overrides 整顆 Config。
-    fn try_load_path_field(p: &std::path::Path) -> Option<Self> {
+    /// 從 `~/.mori/config.json` 撈 `providers.groq.api_key`(跟 mori-desktop 同一份)。
+    /// placeholder(`REPLACE...`)或空字串都當沒設。
+    fn try_load_groq_key_from_mori(p: &std::path::Path) -> Option<String> {
         let text = std::fs::read_to_string(p).ok()?;
         let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-        let groq_api_key = v
-            .pointer("/providers/groq/api_key")
+        v.pointer("/providers/groq/api_key")
             .and_then(|s| s.as_str())
-            .filter(|s| !s.starts_with("REPLACE"))
-            .unwrap_or("")
-            .to_string();
-        Some(Self {
-            hotkey: default_hotkey(),
-            groq_api_key,
-            language: String::new(),
-            raw: false,
-        })
+            .filter(|s| !s.is_empty() && !s.starts_with("REPLACE"))
+            .map(|s| s.to_string())
     }
 
     fn resolved_api_key(&self) -> Option<String> {

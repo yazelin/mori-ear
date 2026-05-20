@@ -55,9 +55,11 @@ if (-not (Test-Path -LiteralPath $resolvedExe -PathType Leaf)) {
     throw "mori-ear.exe not found: $resolvedExe"
 }
 
-$escapedExe = $resolvedExe -replace "'", "''"
-$actionArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"Start-Process -FilePath '$escapedExe' -WindowStyle Hidden`""
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $actionArgs
+# 直接呼叫 mori-ear.exe —— release build 設了 windows_subsystem = "windows",
+# 沒 console 視窗,不會跳黑框。
+# (舊版包 powershell.exe -WindowStyle Hidden 是為了藏 console;但 Hidden 只對 GUI
+#  視窗有效,對 console subsystem 的子程序沒用,所以還是會閃黑框 — 改 binary 才是根治。)
+$action = New-ScheduledTaskAction -Execute $resolvedExe
 
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 if ($DelaySeconds -gt 0) {

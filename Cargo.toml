@@ -49,6 +49,9 @@ windows = { version = "0.58", features = [
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    # AttachConsole(ATTACH_PARENT_PROCESS) — release build 設了 windows_subsystem = "windows",
+    # 從 terminal 跑時靠這個重新接回父 console 印 log;autostart 沒父 console,自然 no-op
+    "Win32_System_Console",
 ] }
 
 [profile.release]

@@ -9,41 +9,56 @@
   <meta property="og:description" content="全域熱鍵 → 錄音 → STT → 焦點視窗。Mori 宇宙的第一個器官。">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://yazelin.github.io/mori-ear/">
-  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="icon" type="image/png" href="assets/mori-logo-badge.png">
+  <!-- Mori 品牌字體 — Noto Serif TC(森之筆 Serif) + Noto Sans TC(森之筆 Sans),preconnect 拉低 CDN handshake 延遲 -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;600;700&family=Noto+Serif+TC:wght@500;600;700&display=swap">
   <link rel="stylesheet" href="styles.css">
+  <!-- Theme init — 必須在 <body> render 前跑,避免 dark↔light 切換時 flash。
+       優先序:?theme=… query param(preview / debug)> localStorage > 系統偏好(:root @media) -->
+  <script>
+    (function () {
+      var q = new URLSearchParams(location.search).get("theme");
+      if (q === "light" || q === "dark") {
+        document.documentElement.setAttribute("data-theme", q);
+        return;
+      }
+      try {
+        var saved = localStorage.getItem("mori-ear-theme");
+        if (saved === "light" || saved === "dark") {
+          document.documentElement.setAttribute("data-theme", saved);
+        }
+      } catch (_) { /* localStorage blocked (incognito 等)→ 走系統偏好 */ }
+    })();
+  </script>
 </head>
 <body>
 
 <nav class="nav">
   <a href="#top" class="brand">
-    <svg class="brand-icon" viewBox="0 0 32 32" aria-hidden="true">
-      <use href="#ear-icon"/>
-    </svg>
+    <img class="brand-icon" src="assets/mori-logo-badge.png" alt="" width="28" height="28">
     <span>mori-ear</span>
   </a>
-  <ul class="nav-links">
-    <li><a href="#install">安裝</a></li>
-    <li><a href="#usage">使用</a></li>
-    <li><a href="#config">設定</a></li>
-    <li><a href="#support">平台支援</a></li>
-    <li><a href="https://github.com/yazelin/mori-ear" target="_blank" rel="noopener">GitHub</a></li>
-  </ul>
+  <div class="nav-right">
+    <ul class="nav-links">
+      <li><a href="#install">安裝</a></li>
+      <li><a href="#usage">使用</a></li>
+      <li><a href="#config">設定</a></li>
+      <li><a href="#support">平台支援</a></li>
+      <li><a href="https://github.com/yazelin/mori-ear" target="_blank" rel="noopener">GitHub</a></li>
+    </ul>
+    <button class="theme-toggle" type="button" aria-label="切換主題" title="切換 light / dark">
+      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+      </svg>
+      <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="4"/>
+        <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+      </svg>
+    </button>
+  </div>
 </nav>
-
-<svg width="0" height="0" style="position:absolute" aria-hidden="true">
-  <defs>
-    <!-- 抽象「耳朵 + 音波」icon — 不是解剖學的耳,而是聽覺感的螺旋 + 同心波 -->
-    <symbol id="ear-icon" viewBox="0 0 64 64">
-      <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M22 14 C 12 14 10 24 12 32 C 13 38 16 42 20 46 C 22 48 24 50 26 52"/>
-        <path d="M22 22 C 18 22 17 26 18 30 C 19 33 21 36 24 38"/>
-        <path d="M40 12 C 50 14 56 22 56 32"/>
-        <path d="M44 18 C 52 22 54 28 53 34"/>
-        <path d="M48 26 C 53 30 54 34 52 38"/>
-      </g>
-    </symbol>
-  </defs>
-</svg>
 
 <header class="hero" id="top">
   <div class="hero-text">
@@ -60,38 +75,10 @@
     </div>
   </div>
   <div class="hero-art" aria-hidden="true">
-    <svg viewBox="0 0 320 320" class="hero-svg">
-      <!-- 同心音波 -->
-      <g fill="none" stroke-width="2.5" stroke-linecap="round">
-        <circle cx="80" cy="160" r="46" stroke="var(--sage)" stroke-opacity=".55"/>
-        <circle cx="80" cy="160" r="72" stroke="var(--sage)" stroke-opacity=".35"/>
-        <circle cx="80" cy="160" r="100" stroke="var(--sage)" stroke-opacity=".18"/>
-      </g>
-      <!-- 抽象耳朵 -->
-      <g fill="none" stroke="var(--lavender)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M160 80 C 110 80 88 130 96 170 C 102 200 120 220 140 235"/>
-        <path d="M160 110 C 130 110 118 140 124 165 C 130 185 142 198 156 208"/>
-        <path d="M160 140 C 145 140 138 155 142 170 C 146 182 154 188 162 192"/>
-      </g>
-      <!-- 流向聊天泡泡 -->
-      <g fill="none" stroke="var(--blush)" stroke-width="2.5" stroke-linecap="round">
-        <path d="M180 100 C 210 90 240 95 260 110" stroke-opacity=".7"/>
-        <path d="M190 160 C 225 155 250 160 270 170" stroke-opacity=".7"/>
-        <path d="M180 220 C 215 225 240 225 258 215" stroke-opacity=".7"/>
-      </g>
-      <!-- 聊天泡泡 -->
-      <g fill="var(--blush)" fill-opacity=".18" stroke="var(--blush)" stroke-width="1.8">
-        <rect x="252" y="88" width="56" height="32" rx="10"/>
-        <rect x="260" y="150" width="48" height="28" rx="10"/>
-        <rect x="248" y="200" width="60" height="30" rx="10"/>
-      </g>
-      <!-- 泡泡裡假的「字」(其實是小點) -->
-      <g fill="var(--blush)" fill-opacity=".75">
-        <circle cx="266" cy="104" r="2"/><circle cx="274" cy="104" r="2"/><circle cx="282" cy="104" r="2"/><circle cx="290" cy="104" r="2"/>
-        <circle cx="272" cy="164" r="2"/><circle cx="280" cy="164" r="2"/><circle cx="288" cy="164" r="2"/>
-        <circle cx="262" cy="215" r="2"/><circle cx="270" cy="215" r="2"/><circle cx="278" cy="215" r="2"/><circle cx="286" cy="215" r="2"/>
-      </g>
-    </svg>
+    <img class="hero-img" src="assets/mori-listening.png"
+         alt="Mori 在聆聽"
+         width="420" height="420"
+         loading="eager">
   </div>
 </header>
 
@@ -300,9 +287,7 @@
 <footer class="footer">
   <div class="footer-main">
     <a class="brand" href="#top">
-      <svg class="brand-icon" viewBox="0 0 32 32" aria-hidden="true">
-        <use href="#ear-icon"/>
-      </svg>
+      <img class="brand-icon" src="assets/mori-logo-badge.png" alt="" width="28" height="28">
       <span>mori-ear</span>
     </a>
     <div class="footer-links">

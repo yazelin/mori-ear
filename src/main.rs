@@ -1,3 +1,8 @@
+// Windows release build:windowless subsystem,避免 autostart 跳黑框 console。
+// 從 terminal 跑時用 AttachConsole(ATTACH_PARENT_PROCESS) 接回父 console,log 照印。
+// Debug build 保留 console,方便 `cargo run` 開發時直接看 log。
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 //! mori-ear:Mori 的「耳朵」器官 — 極簡 CLI。
 //!
 //! 流程:
@@ -158,8 +163,87 @@ fn key_to_code(k: &str) -> Option<Code> {
     })
 }
 
+/// Windows release(windows_subsystem = "windows")沒自帶 console — 從 terminal 啟動時
+/// 主動 attach 回父 process 的 console,讓 log/stdout 還是看得到。
+/// scheduled task 啟動(沒父 console)時 AttachConsole 自然失敗,維持完全靜默。
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+fn attach_parent_console_if_any() {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+/// global-hotkey 0.6 在 Windows 上 register 到一顆 hidden window,WM_HOTKEY 走 thread
+/// message queue —— **caller 必須在同條 thread 跑 GetMessage/DispatchMessage**
+/// WindowProc 才會被叫,event 才會 send 進 GlobalHotKeyEvent receiver。
+/// (Linux X11 crate 自己 spawn event thread,不受影響。)
+///
+/// 這條 thread 持有 manager 一直活下去(drop 會 DestroyWindow,所有 hotkey 失效),
+/// 然後在裡面跑 GetMessage loop。註冊結果用 sync mpsc 同步回主 thread,失敗就 propagate。
+fn spawn_hotkey_thread(hotkey: HotKey, hotkey_label: String) -> Result<()> {
+    let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<()>>();
+    std::thread::Builder::new()
+        .name("mori-ear-hotkey".into())
+        .spawn(move || {
+            let manager = match GlobalHotKeyManager::new().context("init global hotkey manager") {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = init_tx.send(Err(e));
+                    return;
+                }
+            };
+            if let Err(e) = manager.register(hotkey).with_context(|| {
+                format!(
+                    "register hotkey {hotkey_label} 失敗 — 可能其他程式(IBus / 桌面環境快捷鍵 / \
+                     另一個 mori-ear)也綁了這把,換 ~/.mori/ear.json `hotkey` 欄位試試別組,\
+                     例 Ctrl+Alt+Y / Ctrl+Shift+V"
+                )
+            }) {
+                let _ = init_tx.send(Err(e));
+                return;
+            }
+            let _ = init_tx.send(Ok(()));
+
+            // Windows:pump message → WindowProc → GlobalHotKeyEvent::send → receiver。
+            // 沒這條 loop 整個 hotkey 鏈路啞掉。
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows::Win32::Foundation::HWND;
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    DispatchMessageW, GetMessageW, TranslateMessage, MSG,
+                };
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).0 > 0 {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+
+            // 非 Windows:crate 已自己 spawn event thread,這條只負責持有 manager 不 drop。
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _keep_alive = manager;
+                loop {
+                    std::thread::park();
+                }
+            }
+
+            // Windows 路徑:讓 manager 跟 thread 同壽命(這行讓編譯器知道 manager 不能更早 drop)
+            #[cfg(target_os = "windows")]
+            drop(manager);
+        })
+        .context("spawn hotkey thread")?;
+
+    init_rx.recv().context("hotkey thread init channel closed")??;
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> ExitCode {
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    attach_parent_console_if_any();
+
     // log → stderr,讓 stdout 純粹只給 transcript(user pipe 用)
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -210,14 +294,13 @@ async fn run() -> Result<ExitCode> {
 
     info!(hotkey = %cfg.hotkey, "mori-ear ready — 按住熱鍵說話、放開停止");
 
-    let manager = GlobalHotKeyManager::new().context("init global hotkey manager")?;
-    manager.register(hotkey).with_context(|| {
-        format!(
-            "register hotkey {} 失敗 — 可能其他程式(IBus / 桌面環境快捷鍵 / 另一個 mori-ear)也綁了這把,\
-             換 ~/.mori/ear.json `hotkey` 欄位試試別組,例 Ctrl+Alt+Y / Ctrl+Shift+V",
-            cfg.hotkey
-        )
-    })?;
+    // global-hotkey 0.6 在 Windows 上把 RegisterHotKey 綁到 hidden window,WM_HOTKEY
+    // 進 thread queue 後**需要那條 thread 自己 pump message** WindowProc 才會被呼叫。
+    // tokio runtime 的 worker thread 不 pump Win32 message;直接在 main 建 manager
+    // 會 register 成功但 event 永遠收不到。
+    // 解法:Windows 上專開一條 OS thread 建 manager + register + 跑 GetMessage loop。
+    // Linux X11 crate 自己 spawn event thread,不受影響,維持原本 main thread 路徑即可。
+    spawn_hotkey_thread(hotkey, cfg.hotkey.clone())?;
 
     // 共用狀態:目前是不是錄音中。audio::Recorder handle 也存這
     let recorder = Arc::new(Mutex::new(None::<audio::Recorder>));

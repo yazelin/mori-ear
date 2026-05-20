@@ -99,12 +99,15 @@
 
     <article class="card" id="windows">
       <header class="card-head">
-        <!-- Microsoft 官方 4-square logo,來自 @lobehub/icons(https://lobehub.com/icons) -->
-        <svg class="card-icon" viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M11.49 2H2v9.492h9.492V2h-.002z" fill="#F25022"/>
-          <path d="M22 2h-9.492v9.492H22V2z" fill="#7FBA00"/>
-          <path d="M11.49 12.508H2V22h9.492v-9.492h-.002z" fill="#00A4EF"/>
-          <path d="M22 12.508h-9.492V22H22v-9.492z" fill="#FFB900"/>
+        <!-- Microsoft 4-square logo(@lobehub/icons),整套頁面 monochrome,
+             4 個 path 全部吃 currentColor → .card-icon 的 --c-accent,跟 Tux / GitHub 同色軸。
+             Brand 識別靠形狀(4 方格),不靠顏色。 -->
+        <svg class="card-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <title>Microsoft / Windows</title>
+          <path d="M11.49 2H2v9.492h9.492V2h-.002z"/>
+          <path d="M22 2h-9.492v9.492H22V2z"/>
+          <path d="M11.49 12.508H2V22h9.492v-9.492h-.002z"/>
+          <path d="M22 12.508h-9.492V22H22v-9.492z"/>
         </svg>
         <h3>Windows · 預編譯</h3>
       </header>

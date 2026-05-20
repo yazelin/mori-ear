@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mori-ear — 全域熱鍵 → 錄音 → STT → 焦點視窗</title>
+  <meta name="description" content="Mori 宇宙的「耳朵」器官：極簡 CLI,全域熱鍵錄音、Groq Whisper 轉錄、自動貼進焦點視窗。獨立於 mori-desktop,身體重啟時耳朵還在聽。">
+  <meta property="og:title" content="mori-ear">
+  <meta property="og:description" content="全域熱鍵 → 錄音 → STT → 焦點視窗。Mori 宇宙的第一個器官。">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://yazelin.github.io/mori-ear/">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="nav">
+  <a href="#top" class="brand">
+    <svg class="brand-icon" viewBox="0 0 32 32" aria-hidden="true">
+      <use href="#ear-icon"/>
+    </svg>
+    <span>mori-ear</span>
+  </a>
+  <ul class="nav-links">
+    <li><a href="#install">安裝</a></li>
+    <li><a href="#usage">使用</a></li>
+    <li><a href="#config">設定</a></li>
+    <li><a href="#support">平台支援</a></li>
+    <li><a href="https://github.com/yazelin/mori-ear" target="_blank" rel="noopener">GitHub</a></li>
+  </ul>
+</nav>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <!-- 抽象「耳朵 + 音波」icon — 不是解剖學的耳,而是聽覺感的螺旋 + 同心波 -->
+    <symbol id="ear-icon" viewBox="0 0 64 64">
+      <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M22 14 C 12 14 10 24 12 32 C 13 38 16 42 20 46 C 22 48 24 50 26 52"/>
+        <path d="M22 22 C 18 22 17 26 18 30 C 19 33 21 36 24 38"/>
+        <path d="M40 12 C 50 14 56 22 56 32"/>
+        <path d="M44 18 C 52 22 54 28 53 34"/>
+        <path d="M48 26 C 53 30 54 34 52 38"/>
+      </g>
+    </symbol>
+  </defs>
+</svg>
+
+<header class="hero" id="top">
+  <div class="hero-text">
+    <h1 class="title">mori-ear</h1>
+    <p class="tagline">全域熱鍵 → 錄音 → STT → 焦點視窗</p>
+    <p class="lede">
+      Mori 宇宙的「耳朵」器官 — 極簡 CLI。獨立於
+      <a href="https://github.com/yazelin/mori-desktop" target="_blank" rel="noopener">mori-desktop</a>(身體 / GUI),
+      身體重啟時耳朵還在聽。
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="#windows">Windows 安裝</a>
+      <a class="btn btn-outline" href="#linux">Linux 安裝</a>
+    </div>
+  </div>
+  <div class="hero-art" aria-hidden="true">
+    <svg viewBox="0 0 320 320" class="hero-svg">
+      <!-- 同心音波 -->
+      <g fill="none" stroke-width="2.5" stroke-linecap="round">
+        <circle cx="80" cy="160" r="46" stroke="var(--sage)" stroke-opacity=".55"/>
+        <circle cx="80" cy="160" r="72" stroke="var(--sage)" stroke-opacity=".35"/>
+        <circle cx="80" cy="160" r="100" stroke="var(--sage)" stroke-opacity=".18"/>
+      </g>
+      <!-- 抽象耳朵 -->
+      <g fill="none" stroke="var(--lavender)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M160 80 C 110 80 88 130 96 170 C 102 200 120 220 140 235"/>
+        <path d="M160 110 C 130 110 118 140 124 165 C 130 185 142 198 156 208"/>
+        <path d="M160 140 C 145 140 138 155 142 170 C 146 182 154 188 162 192"/>
+      </g>
+      <!-- 流向聊天泡泡 -->
+      <g fill="none" stroke="var(--blush)" stroke-width="2.5" stroke-linecap="round">
+        <path d="M180 100 C 210 90 240 95 260 110" stroke-opacity=".7"/>
+        <path d="M190 160 C 225 155 250 160 270 170" stroke-opacity=".7"/>
+        <path d="M180 220 C 215 225 240 225 258 215" stroke-opacity=".7"/>
+      </g>
+      <!-- 聊天泡泡 -->
+      <g fill="var(--blush)" fill-opacity=".18" stroke="var(--blush)" stroke-width="1.8">
+        <rect x="252" y="88" width="56" height="32" rx="10"/>
+        <rect x="260" y="150" width="48" height="28" rx="10"/>
+        <rect x="248" y="200" width="60" height="30" rx="10"/>
+      </g>
+      <!-- 泡泡裡假的「字」(其實是小點) -->
+      <g fill="var(--blush)" fill-opacity=".75">
+        <circle cx="266" cy="104" r="2"/><circle cx="274" cy="104" r="2"/><circle cx="282" cy="104" r="2"/><circle cx="290" cy="104" r="2"/>
+        <circle cx="272" cy="164" r="2"/><circle cx="280" cy="164" r="2"/><circle cx="288" cy="164" r="2"/>
+        <circle cx="262" cy="215" r="2"/><circle cx="270" cy="215" r="2"/><circle cx="278" cy="215" r="2"/><circle cx="286" cy="215" r="2"/>
+      </g>
+    </svg>
+  </div>
+</header>
+
+<section class="quickstart">
+  <h2 class="section-heading">快速開始</h2>
+  <p class="section-sub">已經有 Rust + Groq API key?一行裝完跑起來。</p>
+  <div class="code-block" data-copy="cargo install --path . &amp;&amp; mori-ear &amp;">
+    <pre><code><span class="tok-cmd">cargo</span> install <span class="tok-flag">--path</span> . <span class="tok-op">&amp;&amp;</span> <span class="tok-cmd">mori-ear</span> <span class="tok-op">&amp;</span></code></pre>
+    <button class="copy-btn" type="button" aria-label="複製">複製</button>
+  </div>
+</section>
+
+<section class="install" id="install">
+  <h2 class="section-heading">安裝路徑</h2>
+  <p class="section-sub">兩種路徑,挑一個:預編譯 binary(快、不用 Rust 工具鍊)或從原始碼。</p>
+
+  <div class="card-grid">
+
+    <article class="card" id="windows">
+      <header class="card-head">
+        <svg class="card-icon" viewBox="0 0 32 32" aria-hidden="true">
+          <rect x="3" y="6" width="11" height="11" fill="var(--lavender)"/>
+          <rect x="17" y="6" width="12" height="11" fill="var(--lavender)"/>
+          <rect x="3" y="20" width="11" height="11" fill="var(--lavender)"/>
+          <rect x="17" y="20" width="12" height="11" fill="var(--lavender)"/>
+        </svg>
+        <h3>Windows · 預編譯</h3>
+      </header>
+      <ol class="steps">
+        <li>設 Groq key:<code>setx GROQ_API_KEY gsk_xxxxx</code></li>
+        <li>從 <a href="https://github.com/yazelin/mori-ear/actions" target="_blank" rel="noopener">Actions</a> 抓最新 <code>mori-ear-windows-x86_64.zip</code>,解壓到固定路徑。</li>
+        <li>跑 <code>install-autostart.ps1</code>(會彈 UAC,點是)→ 登入後自動啟動。</li>
+        <li>立即啟動:<code>Start-Process .\mori-ear.exe</code></li>
+      </ol>
+      <a class="card-link" href="#windows-source">從原始碼?→</a>
+    </article>
+
+    <article class="card" id="linux">
+      <header class="card-head">
+        <svg class="card-icon" viewBox="0 0 32 32" aria-hidden="true">
+          <circle cx="16" cy="16" r="12" fill="var(--sage)"/>
+          <circle cx="12" cy="14" r="1.6" fill="var(--bg)"/>
+          <circle cx="20" cy="14" r="1.6" fill="var(--bg)"/>
+          <path d="M11 21 Q 16 25 21 21" stroke="var(--bg)" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+        </svg>
+        <h3>Linux · 預編譯(X11)</h3>
+      </header>
+      <ol class="steps">
+        <li>設 key + paste-back deps:<br><code>export GROQ_API_KEY=gsk_xxxxx</code><br><code>sudo apt install xclip xdotool</code></li>
+        <li>從 <a href="https://github.com/yazelin/mori-ear/actions" target="_blank" rel="noopener">Actions</a> 抓 <code>mori-ear-linux-x86_64.tar.gz</code>,<code>tar -xzf …</code> 後 <code>install -m 755 mori-ear ~/.local/bin/</code>。</li>
+        <li>登入自動啟動:<code>bash scripts/install-autostart.sh</code></li>
+        <li>立即啟動:<code>mori-ear &amp;</code></li>
+      </ol>
+      <a class="card-link" href="#linux-source">從原始碼?→</a>
+    </article>
+
+    <article class="card" id="source">
+      <header class="card-head">
+        <svg class="card-icon" viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M10 8 L 4 16 L 10 24" stroke="var(--blush)" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M22 8 L 28 16 L 22 24" stroke="var(--blush)" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M14 26 L 18 6" stroke="var(--blush)" stroke-width="2.4" fill="none" stroke-linecap="round"/>
+        </svg>
+        <h3>從原始碼建置</h3>
+      </header>
+      <ol class="steps">
+        <li>裝 <a href="https://rustup.rs/" target="_blank" rel="noopener">Rust</a>。Windows 加裝 MSVC C++ Build Tools(rustup-init 會提示);Linux 加 <code>libasound2-dev libx11-dev xclip xdotool</code>。</li>
+        <li><code>git clone https://github.com/yazelin/mori-ear &amp;&amp; cd mori-ear</code></li>
+        <li><code>cargo install --path .</code> — binary 進 <code>~/.cargo/bin/</code>。</li>
+        <li>依平台跑 <code>scripts/install-autostart.{ps1,sh}</code> 設登入自動啟動。</li>
+      </ol>
+      <a class="card-link" href="https://github.com/yazelin/mori-ear#安裝" target="_blank" rel="noopener">完整 README →</a>
+    </article>
+
+  </div>
+</section>
+
+<section class="usage" id="usage">
+  <h2 class="section-heading">使用</h2>
+  <div class="usage-flow">
+    <div class="flow-step">
+      <span class="flow-step-num">1</span>
+      <p class="flow-step-title">按住 <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>E</kbd></p>
+      <p class="flow-step-desc">開麥克風錄音</p>
+    </div>
+    <div class="flow-arrow" aria-hidden="true">→</div>
+    <div class="flow-step">
+      <span class="flow-step-num">2</span>
+      <p class="flow-step-title">講話</p>
+      <p class="flow-step-desc">繁中、英文、混講都可</p>
+    </div>
+    <div class="flow-arrow" aria-hidden="true">→</div>
+    <div class="flow-step">
+      <span class="flow-step-num">3</span>
+      <p class="flow-step-title">放開</p>
+      <p class="flow-step-desc">Whisper STT + cleanup LLM</p>
+    </div>
+    <div class="flow-arrow" aria-hidden="true">→</div>
+    <div class="flow-step">
+      <span class="flow-step-num">4</span>
+      <p class="flow-step-title">字貼進焦點視窗</p>
+      <p class="flow-step-desc">clipboard + Ctrl+V(terminal 自動切 +Shift)</p>
+    </div>
+  </div>
+
+  <h3 class="feature-heading">特性</h3>
+  <div class="feature-grid">
+    <div class="feature">
+      <svg class="feature-icon" viewBox="0 0 32 32" aria-hidden="true">
+        <rect x="3" y="9" width="6" height="6" rx="1.5" fill="var(--lavender)"/>
+        <rect x="11" y="9" width="6" height="6" rx="1.5" fill="var(--lavender)"/>
+        <rect x="19" y="9" width="6" height="6" rx="1.5" fill="var(--lavender)"/>
+      </svg>
+      <h4>全域熱鍵</h4>
+      <p>任何視窗按 Ctrl+Alt+E 就講話。可改 <code>~/.mori/ear.json</code> 的 <code>hotkey</code> 欄位。</p>
+    </div>
+    <div class="feature">
+      <svg class="feature-icon" viewBox="0 0 32 32" aria-hidden="true">
+        <rect x="4" y="6" width="20" height="16" rx="2" stroke="var(--blush)" stroke-width="2" fill="none"/>
+        <path d="M9 16 L 13 20 L 21 12" stroke="var(--blush)" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <h4>自動貼回焦點視窗</h4>
+      <p>Win32 clipboard + SendInput,Linux 走 xclip + xdotool。Terminal 自動偵測切 Ctrl+Shift+V。</p>
+    </div>
+    <div class="feature">
+      <svg class="feature-icon" viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M4 12 Q 4 16 8 16" stroke="var(--sage)" stroke-width="2" fill="none" stroke-linecap="round"/>
+        <path d="M28 12 Q 28 16 24 16" stroke="var(--sage)" stroke-width="2" fill="none" stroke-linecap="round"/>
+        <rect x="13" y="6" width="6" height="16" rx="3" fill="var(--sage)"/>
+        <path d="M16 24 L 16 28" stroke="var(--sage)" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <h4>Groq Whisper 後端</h4>
+      <p>快(~1.5s for 3s 音檔)、便宜、繁中支援良好。Groq key 跟 mori-desktop 共用。</p>
+    </div>
+    <div class="feature">
+      <svg class="feature-icon" viewBox="0 0 32 32" aria-hidden="true">
+        <circle cx="16" cy="16" r="11" stroke="var(--lavender)" stroke-width="2" fill="none"/>
+        <text x="16" y="21" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="700" fill="var(--lavender)">繁</text>
+      </svg>
+      <h4>繁中校正 LLM</h4>
+      <p>Whisper 簡體輸出 + 偶爾幻覺出 YouTube 結尾語 — cleanup LLM 二次處理,清掉雜訊、轉繁體。</p>
+    </div>
+  </div>
+</section>
+
+<section class="config" id="config">
+  <h2 class="section-heading">設定</h2>
+  <p class="section-sub"><code>~/.mori/ear.json</code>(可選,partial merge — 沒寫的欄位從 <code>~/.mori/config.json</code> / 預設補):</p>
+  <div class="code-block" data-copy='{"hotkey":"Ctrl+Alt+E","groq_api_key":"gsk_...","language":"zh","raw":false}'>
+    <pre><code>{
+  <span class="tok-key">"hotkey"</span>: <span class="tok-str">"Ctrl+Alt+E"</span>,
+  <span class="tok-key">"groq_api_key"</span>: <span class="tok-str">"gsk_..."</span>,
+  <span class="tok-key">"language"</span>: <span class="tok-str">"zh"</span>,
+  <span class="tok-key">"raw"</span>: <span class="tok-bool">false</span>
+}</code></pre>
+    <button class="copy-btn" type="button" aria-label="複製">複製</button>
+  </div>
+  <ul class="config-notes">
+    <li><strong>hotkey</strong>:任意組合,被其他程式佔用會 register 失敗 — 換一組(例 <code>Ctrl+Shift+V</code> / <code>Ctrl+Alt+Y</code>)。</li>
+    <li><strong>groq_api_key</strong>:留空時 fallback <code>~/.mori/config.json</code> 的 <code>providers.groq.api_key</code>,再 fallback 環境變數 <code>GROQ_API_KEY</code>。</li>
+    <li><strong>language</strong>:空 = 自動偵測。<code>zh</code> / <code>en</code> / 其他 ISO 639-1。</li>
+    <li><strong>raw</strong>:<code>true</code> = 跳過 cleanup LLM,直接送 raw Whisper 輸出。省 ~200ms / 一輪 token,但會有錯字 / 簡體。</li>
+  </ul>
+</section>
+
+<section class="support" id="support">
+  <h2 class="section-heading">平台支援</h2>
+  <table class="support-table">
+    <thead>
+      <tr>
+        <th>環境</th>
+        <th>hotkey</th>
+        <th>paste-back</th>
+        <th>備註</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Windows</strong></td>
+        <td class="ok">✓</td>
+        <td class="ok">✓</td>
+        <td>主要驗證環境;Win32 SetClipboardData + SendInput Ctrl+V</td>
+      </tr>
+      <tr>
+        <td>Linux <strong>X11</strong></td>
+        <td class="ok">✓</td>
+        <td class="ok">✓</td>
+        <td>xclip + xdotool ctrl+v,Terminal 自動偵測切 +Shift</td>
+      </tr>
+      <tr>
+        <td>Linux <strong>Wayland</strong></td>
+        <td class="warn">⚠ 部分</td>
+        <td class="warn">⚠ 部分</td>
+        <td>XWayland 兜底:只能跟 X11 視窗互動。完整支援要 <code>ashpd</code> + <code>ydotool/wtype</code></td>
+      </tr>
+      <tr>
+        <td>macOS</td>
+        <td class="ok">✓(理論)</td>
+        <td class="ok">✓(理論)</td>
+        <td>第一次跑要授權 Accessibility;paste-back 走 enigo <code>text()</code> 逐字 fallback</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<footer class="footer">
+  <div class="footer-main">
+    <a class="brand" href="#top">
+      <svg class="brand-icon" viewBox="0 0 32 32" aria-hidden="true">
+        <use href="#ear-icon"/>
+      </svg>
+      <span>mori-ear</span>
+    </a>
+    <div class="footer-links">
+      <a href="https://github.com/yazelin/mori-ear" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/yazelin/mori-ear/blob/main/LICENSE" target="_blank" rel="noopener">MIT / Apache-2.0</a>
+      <a href="https://github.com/yazelin/mori-ear/actions" target="_blank" rel="noopener">Actions</a>
+    </div>
+  </div>
+  <p class="universe">
+    part of the <strong>Mori 宇宙</strong> · 同系列規劃:
+    <span class="org-pending">mori-eye</span> ·
+    <span class="org-pending">mori-hand</span> ·
+    <span class="org-pending">mori-lip</span>
+  </p>
+</footer>
+
+<script src="scripts.js" defer></script>
+</body>
+</html>

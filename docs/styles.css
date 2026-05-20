@@ -669,35 +669,17 @@ section::before {
 }
 
 .card-icon {
-  width: 92px;
-  height: 70px;
-  padding: 4px;
+  width: 56px;
+  height: 56px;
+  padding: 8px;
   overflow: visible;
-  color: var(--sandstone);
-  background: transparent;
-  border-radius: 0;
-  filter: drop-shadow(0 0 8px rgba(239, 230, 207, 0.16));
+  color: var(--c-accent);
+  background: var(--c-accent-bg);
+  border-radius: 12px;
 }
-
-.card-icon * {
-  fill: none !important;
-  stroke: currentColor !important;
-  stroke-width: 1.45 !important;
-  stroke-linecap: round !important;
-  stroke-linejoin: round !important;
-  vector-effect: non-scaling-stroke;
-}
-
-.card:nth-child(1) .card-icon,
-.card:nth-child(2) .card-icon,
-.card:nth-child(3) .card-icon {
-  background:
-    linear-gradient(135deg, transparent 48%, currentColor 49% 51%, transparent 52%),
-    radial-gradient(ellipse at 50% 76%, currentColor 0 1px, transparent 2px);
-  background-size: 80px 56px, 70px 34px;
-  background-position: center 10px, center 22px;
-  background-repeat: no-repeat;
-}
+/* 拿掉 codex 的 SVG 全域覆寫 + 三條 card 的「135度斜線 + 圓點」background_image —
+   那兩個是 hero icons 上 user 一直看到的「斜線」來源。讓 SVG 用原本 inline 的
+   fill / stroke(Windows 4 方格 / Linux 笑臉 / from-source 角括號)各自顯示。 */
 
 .card h3,
 .feature h4 {

@@ -138,9 +138,10 @@
     <article class="card" id="source">
       <header class="card-head">
         <svg class="card-icon" viewBox="0 0 32 32" aria-hidden="true">
-          <path d="M10 8 L 4 16 L 10 24" stroke="var(--c-accent)" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-          <path d="M22 8 L 28 16 L 22 24" stroke="var(--c-accent)" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-          <path d="M14 26 L 18 6" stroke="var(--c-accent)" stroke-width="2.4" fill="none" stroke-linecap="round"/>
+          <!-- 角括號 < >;原本中間還有一條 M14 26 L 18 6 的斜線(代表 code 的「/」),
+               user 反應「icon 上的斜線」很怪,移除這條讓 icon 只剩兩個括號。 -->
+          <path d="M11 8 L 4 16 L 11 24" stroke="var(--c-accent)" stroke-width="2.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M21 8 L 28 16 L 21 24" stroke="var(--c-accent)" stroke-width="2.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
         <h3>從原始碼建置</h3>
       </header>

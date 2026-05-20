@@ -75,9 +75,9 @@
     </div>
   </div>
   <div class="hero-art" aria-hidden="true">
-    <img class="hero-img" src="assets/mori-listening.png"
+    <img class="hero-img" src="assets/mori-hero.png"
          alt="Mori 在聆聽"
-         width="420" height="420"
+         width="540" height="540"
          loading="eager">
   </div>
 </header>
@@ -100,10 +100,10 @@
     <article class="card" id="windows">
       <header class="card-head">
         <svg class="card-icon" viewBox="0 0 32 32" aria-hidden="true">
-          <rect x="3" y="6" width="11" height="11" fill="var(--lavender)"/>
-          <rect x="17" y="6" width="12" height="11" fill="var(--lavender)"/>
-          <rect x="3" y="20" width="11" height="11" fill="var(--lavender)"/>
-          <rect x="17" y="20" width="12" height="11" fill="var(--lavender)"/>
+          <rect x="3" y="6" width="11" height="11" fill="var(--c-accent)"/>
+          <rect x="17" y="6" width="12" height="11" fill="var(--c-accent)"/>
+          <rect x="3" y="20" width="11" height="11" fill="var(--c-accent)"/>
+          <rect x="17" y="20" width="12" height="11" fill="var(--c-accent)"/>
         </svg>
         <h3>Windows · 預編譯</h3>
       </header>
@@ -119,10 +119,10 @@
     <article class="card" id="linux">
       <header class="card-head">
         <svg class="card-icon" viewBox="0 0 32 32" aria-hidden="true">
-          <circle cx="16" cy="16" r="12" fill="var(--sage)"/>
-          <circle cx="12" cy="14" r="1.6" fill="var(--bg)"/>
-          <circle cx="20" cy="14" r="1.6" fill="var(--bg)"/>
-          <path d="M11 21 Q 16 25 21 21" stroke="var(--bg)" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+          <circle cx="16" cy="16" r="12" fill="var(--c-accent)"/>
+          <circle cx="12" cy="14" r="1.6" fill="var(--c-bg)"/>
+          <circle cx="20" cy="14" r="1.6" fill="var(--c-bg)"/>
+          <path d="M11 21 Q 16 25 21 21" stroke="var(--c-bg)" stroke-width="1.6" fill="none" stroke-linecap="round"/>
         </svg>
         <h3>Linux · 預編譯(X11)</h3>
       </header>
@@ -138,9 +138,9 @@
     <article class="card" id="source">
       <header class="card-head">
         <svg class="card-icon" viewBox="0 0 32 32" aria-hidden="true">
-          <path d="M10 8 L 4 16 L 10 24" stroke="var(--blush)" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-          <path d="M22 8 L 28 16 L 22 24" stroke="var(--blush)" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-          <path d="M14 26 L 18 6" stroke="var(--blush)" stroke-width="2.4" fill="none" stroke-linecap="round"/>
+          <path d="M10 8 L 4 16 L 10 24" stroke="var(--c-accent)" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M22 8 L 28 16 L 22 24" stroke="var(--c-accent)" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M14 26 L 18 6" stroke="var(--c-accent)" stroke-width="2.4" fill="none" stroke-linecap="round"/>
         </svg>
         <h3>從原始碼建置</h3>
       </header>
@@ -188,35 +188,35 @@
   <div class="feature-grid">
     <div class="feature">
       <svg class="feature-icon" viewBox="0 0 32 32" aria-hidden="true">
-        <rect x="3" y="9" width="6" height="6" rx="1.5" fill="var(--lavender)"/>
-        <rect x="11" y="9" width="6" height="6" rx="1.5" fill="var(--lavender)"/>
-        <rect x="19" y="9" width="6" height="6" rx="1.5" fill="var(--lavender)"/>
+        <rect x="3" y="9" width="6" height="6" rx="1.5" fill="var(--c-accent)"/>
+        <rect x="11" y="9" width="6" height="6" rx="1.5" fill="var(--c-accent)"/>
+        <rect x="19" y="9" width="6" height="6" rx="1.5" fill="var(--c-accent)"/>
       </svg>
       <h4>全域熱鍵</h4>
       <p>任何視窗按 Ctrl+Alt+E 就講話。可改 <code>~/.mori/ear.json</code> 的 <code>hotkey</code> 欄位。</p>
     </div>
     <div class="feature">
       <svg class="feature-icon" viewBox="0 0 32 32" aria-hidden="true">
-        <rect x="4" y="6" width="20" height="16" rx="2" stroke="var(--blush)" stroke-width="2" fill="none"/>
-        <path d="M9 16 L 13 20 L 21 12" stroke="var(--blush)" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        <rect x="4" y="6" width="20" height="16" rx="2" stroke="var(--c-accent)" stroke-width="2" fill="none"/>
+        <path d="M9 16 L 13 20 L 21 12" stroke="var(--c-accent)" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
       <h4>自動貼回焦點視窗</h4>
       <p>Win32 clipboard + SendInput,Linux 走 xclip + xdotool。Terminal 自動偵測切 Ctrl+Shift+V。</p>
     </div>
     <div class="feature">
       <svg class="feature-icon" viewBox="0 0 32 32" aria-hidden="true">
-        <path d="M4 12 Q 4 16 8 16" stroke="var(--sage)" stroke-width="2" fill="none" stroke-linecap="round"/>
-        <path d="M28 12 Q 28 16 24 16" stroke="var(--sage)" stroke-width="2" fill="none" stroke-linecap="round"/>
-        <rect x="13" y="6" width="6" height="16" rx="3" fill="var(--sage)"/>
-        <path d="M16 24 L 16 28" stroke="var(--sage)" stroke-width="2" stroke-linecap="round"/>
+        <path d="M4 12 Q 4 16 8 16" stroke="var(--c-accent)" stroke-width="2" fill="none" stroke-linecap="round"/>
+        <path d="M28 12 Q 28 16 24 16" stroke="var(--c-accent)" stroke-width="2" fill="none" stroke-linecap="round"/>
+        <rect x="13" y="6" width="6" height="16" rx="3" fill="var(--c-accent)"/>
+        <path d="M16 24 L 16 28" stroke="var(--c-accent)" stroke-width="2" stroke-linecap="round"/>
       </svg>
       <h4>Groq Whisper 後端</h4>
       <p>快(~1.5s for 3s 音檔)、便宜、繁中支援良好。Groq key 跟 mori-desktop 共用。</p>
     </div>
     <div class="feature">
       <svg class="feature-icon" viewBox="0 0 32 32" aria-hidden="true">
-        <circle cx="16" cy="16" r="11" stroke="var(--lavender)" stroke-width="2" fill="none"/>
-        <text x="16" y="21" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="700" fill="var(--lavender)">繁</text>
+        <circle cx="16" cy="16" r="11" stroke="var(--c-accent)" stroke-width="2" fill="none"/>
+        <text x="16" y="21" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="9" font-weight="700" fill="var(--c-accent)">繁</text>
       </svg>
       <h4>繁中校正 LLM</h4>
       <p>Whisper 簡體輸出 + 偶爾幻覺出 YouTube 結尾語 — cleanup LLM 二次處理,清掉雜訊、轉繁體。</p>

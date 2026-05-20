@@ -328,15 +328,12 @@ kbd {
   gap: clamp(14px, 4vw, 54px);
 }
 
+/* 整個 .hero::before 拿掉 —— 任何在 hero section 內貼背景的做法(無論是 darker
+   blob 還是 lighter glow)都會在 Mori 身後形成可見的「圈/影」,因為跟 body 自己的
+   背景不同調。body 已經有全頁的 radial atmosphere(forest-night + 邊角微光),
+   hero 不需要再疊一層。Mori 自己的 drop-shadow 提供必要的暈光。 */
 .hero::before {
-  content: "";
-  position: absolute;
-  inset: -120px max(-10vw, -120px) -60px;
-  z-index: -1;
-  background:
-    radial-gradient(ellipse 33% 38% at 77% 41%, rgba(193, 218, 143, 0.18), transparent 68%),
-    radial-gradient(ellipse 55% 70% at 84% 38%, rgba(12, 26, 21, 0.18), transparent 72%),
-    linear-gradient(180deg, transparent 70%, color-mix(in srgb, var(--c-bg) 88%, transparent));
+  content: none;
 }
 
 .hero-text {
@@ -443,46 +440,18 @@ kbd {
   align-self: end;
 }
 
-.hero-art::before {
-  content: "";
-  position: absolute;
-  width: min(92%, 560px);
-  aspect-ratio: 0.92;
-  right: 0;
-  bottom: 0;
-  border-radius: 48% 48% 42% 44%;
-  background:
-    radial-gradient(circle at 50% 38%, rgba(235, 224, 180, 0.13), transparent 34%),
-    radial-gradient(circle at 42% 52%, rgba(168, 197, 147, 0.2), transparent 56%);
-  filter: blur(2px);
-}
-
-.hero-art::after {
-  content: ")))";
-  position: absolute;
-  left: 2%;
-  top: 36%;
-  color: var(--c-accent);
-  font-family: var(--serif);
-  font-size: clamp(3rem, 7vw, 5rem);
-  letter-spacing: 0.04em;
-  line-height: 1;
-  opacity: 0.54;
-  transform: rotate(-3deg) scaleX(0.55);
-  text-shadow: 0 0 18px var(--c-glow);
-}
-
+/* 拿掉所有 .hero-art 的 pseudo-elements 跟 .hero-img 的 effects ——
+   原則:hero 角色的 atmosphere 應該 baked-in 在 PNG 本身(painted halo + leaves),
+   不該由 CSS 在外面貼。任何 ::before / ::after / drop-shadow / circle blob
+   都會在角色週圍留下「可見邊界」,讓 Mori 看起來像「貼上去」而不是「畫進去」。
+   做法:Mori PNG 自帶 painted feather,直接 sit on body bg。 */
 .hero-img {
   position: relative;
-  z-index: 2;
-  width: min(112%, 580px);
+  z-index: 1;
+  width: min(100%, 540px);
   max-width: none;
   height: auto;
   display: block;
-  transform: translate(3%, 3%);
-  filter:
-    drop-shadow(0 28px 45px rgba(0, 0, 0, 0.38))
-    drop-shadow(0 0 48px rgba(181, 208, 139, 0.2));
   animation: mori-float 7s ease-in-out infinite;
 }
 
@@ -492,16 +461,11 @@ section {
   padding: clamp(44px, 6.5vw, 82px) clamp(22px, 5vw, 48px);
 }
 
+/* 拿掉 section::before — codex 原本用一團 radial+linear gradient ellipse 加 mask 當「上分隔」,
+   結果就是每個 section 頂上飄一個可見的淺色橢圓陰影。section 分隔該靠 whitespace + heading 排版
+   做 rhythm,不該用 blob 畫一條粗線。Brand 是 calm/contemplative,不是「有 divider」的工程感。 */
 section::before {
-  content: "";
-  display: block;
-  height: 28px;
-  margin: -34px 0 22px;
-  background:
-    radial-gradient(ellipse 58% 60% at 50% 54%, var(--rim-soft), transparent 64%),
-    linear-gradient(90deg, transparent, var(--rim-soft), transparent);
-  mask-image: radial-gradient(ellipse 100% 46% at 50% 50%, black 34%, transparent 72%);
-  opacity: 0.7;
+  content: none;
 }
 
 .section-heading,

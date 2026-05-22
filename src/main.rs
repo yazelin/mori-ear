@@ -365,17 +365,48 @@ fn paste_back(text: &str) -> anyhow::Result<()> {
     }
 }
 
+/// Linux: pre_exec hook,close 所有 fd >= 3。
+///
+/// 為什麼:`single-instance` 0.3 在 Linux 上創 abstract Unix socket 時沒設 FD_CLOEXEC。
+/// `xclip` 寫完 fork 為 daemon 守 X11 selection — fork 時繼承了 mori-ear 持的所有 FD,
+/// 包括那個 single-instance socket。即使 mori-ear 被 kill,xclip 還活著、socket 還被佔,
+/// 新 mori-ear 啟動時 `SingleInstance::is_single()` 回 false → 報「已經有另一個 mori-ear 在跑」
+/// 直到 xclip 也被殺。
+///
+/// SAFETY: pre_exec 內只能用 async-signal-safe 函式。close(2) 跟 getrlimit(2) 都 AS-safe。
+#[cfg(target_os = "linux")]
+fn pre_exec_close_fds(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut rlim: libc::rlimit = std::mem::zeroed();
+            let max_fd = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
+                (rlim.rlim_cur as libc::c_long).min(libc::c_int::MAX as libc::c_long) as libc::c_int
+            } else {
+                1024
+            };
+            for fd in 3..max_fd {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+    cmd
+}
+
 #[cfg(target_os = "linux")]
 fn paste_back_linux_clipboard(text: &str) -> anyhow::Result<()> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
     // 1. xclip 寫 X11 CLIPBOARD
-    let mut child = Command::new("xclip")
+    let mut xclip_cmd = Command::new("xclip");
+    xclip_cmd
         .args(["-selection", "clipboard"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = pre_exec_close_fds(&mut xclip_cmd)
         .spawn()
         .context("spawn xclip — 沒裝?`sudo apt install xclip xdotool`")?;
     {
@@ -394,8 +425,9 @@ fn paste_back_linux_clipboard(text: &str) -> anyhow::Result<()> {
     let combo = if use_shift { "ctrl+shift+v" } else { "ctrl+v" };
 
     // 3. xdotool key 送組合
-    let status = Command::new("xdotool")
-        .args(["key", "--clearmodifiers", combo])
+    let mut xdotool_cmd = Command::new("xdotool");
+    xdotool_cmd.args(["key", "--clearmodifiers", combo]);
+    let status = pre_exec_close_fds(&mut xdotool_cmd)
         .status()
         .context("spawn xdotool — 沒裝?`sudo apt install xdotool`")?;
     if !status.success() {
@@ -414,10 +446,9 @@ fn paste_back_linux_clipboard(text: &str) -> anyhow::Result<()> {
 #[cfg(target_os = "linux")]
 fn detect_active_window_process_linux() -> Option<String> {
     use std::process::Command;
-    let out = Command::new("xdotool")
-        .args(["getactivewindow", "getwindowpid"])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("xdotool");
+    cmd.args(["getactivewindow", "getwindowpid"]);
+    let out = pre_exec_close_fds(&mut cmd).output().ok()?;
     if !out.status.success() {
         return None;
     }

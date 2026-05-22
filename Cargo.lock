@@ -924,6 +924,7 @@ dependencies = [
  "enigo",
  "global-hotkey",
  "hound",
+ "libc",
  "parking_lot",
  "reqwest",
  "serde",

@@ -255,12 +255,14 @@
 <section class="config" id="config">
   <h2 class="section-heading">設定</h2>
   <p class="section-sub"><code>~/.mori/ear.json</code>(可選,partial merge — 沒寫的欄位從 <code>~/.mori/config.json</code> / 預設補):</p>
-  <div class="code-block" data-copy='{"hotkey":"Ctrl+Alt+E","groq_api_key":"gsk_...","language":"zh","raw":false}'>
+  <div class="code-block" data-copy='{"hotkey":"Ctrl+Alt+E","groq_api_key":"gsk_...","language":"zh","raw":false,"cleanup_prompt_file":"~/.mori/voice_input/USER-00.純文字輸入.md","paste_back":true}'>
     <pre><code>{
   <span class="tok-key">"hotkey"</span>: <span class="tok-str">"Ctrl+Alt+E"</span>,
   <span class="tok-key">"groq_api_key"</span>: <span class="tok-str">"gsk_..."</span>,
   <span class="tok-key">"language"</span>: <span class="tok-str">"zh"</span>,
-  <span class="tok-key">"raw"</span>: <span class="tok-bool">false</span>
+  <span class="tok-key">"raw"</span>: <span class="tok-bool">false</span>,
+  <span class="tok-key">"cleanup_prompt_file"</span>: <span class="tok-str">"~/.mori/voice_input/USER-00.純文字輸入.md"</span>,
+  <span class="tok-key">"paste_back"</span>: <span class="tok-bool">true</span>
 }</code></pre>
     <button class="copy-btn" type="button" aria-label="複製">複製</button>
   </div>
@@ -269,7 +271,17 @@
     <li><strong>groq_api_key</strong>:留空時 fallback <code>~/.mori/config.json</code> 的 <code>providers.groq.api_key</code>,再 fallback 環境變數 <code>GROQ_API_KEY</code>。</li>
     <li><strong>language</strong>:空 = 自動偵測。<code>zh</code> / <code>en</code> / 其他 ISO 639-1。</li>
     <li><strong>raw</strong>:<code>true</code> = 跳過 cleanup LLM,直接送 raw Whisper 輸出。省 ~200ms / 一輪 token,但會有錯字 / 簡體。</li>
+    <li><strong>cleanup_prompt_file</strong>:cleanup LLM 的 system prompt 來源 <code>.md</code> / <code>.txt</code> 路徑(支援 <code>~/</code>)。空 / 檔不存在 → fallback 內建。<strong>每次 cleanup live-read</strong>,改 prompt 不必重啟。指向 mori-desktop 的 <code>USER-00.純文字輸入.md</code> 可共用同一份。</li>
+    <li><strong>paste_back</strong>:<code>true</code>(預設)同時印 stdout + 貼焦點視窗;<code>false</code> 只印 stdout,不碰 clipboard。pipe / headless 場景設 false。</li>
   </ul>
+
+  <h3 class="feature-heading">Batch / pipe 模式</h3>
+  <p class="section-sub">不按熱鍵,直接餵音檔(<code>wav</code> / <code>mp3</code> / <code>m4a</code> / <code>flac</code> / <code>webm</code> / <code>ogg</code>)轉文字到 stdout。跟 daemon 模式互不衝突。</p>
+  <div class="code-block" data-copy="mori-ear --input recording.wav > out.txt">
+    <pre><code><span class="tok-cmd">mori-ear</span> <span class="tok-flag">--input</span> recording.wav <span class="tok-op">&gt;</span> out.txt
+<span class="tok-cmd">mori-ear</span> <span class="tok-flag">--input</span> clip.wav <span class="tok-op">|</span> <span class="tok-cmd">translate</span> <span class="tok-flag">-t</span> en</code></pre>
+    <button class="copy-btn" type="button" aria-label="複製">複製</button>
+  </div>
 </section>
 
 <section class="support" id="support">

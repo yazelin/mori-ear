@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 const URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 const MODEL: &str = "openai/gpt-oss-120b";
 
-const SYSTEM_PROMPT: &str = "你是 mori 語音輸入助理。把 STT 輸出的純文字做最小幅度校正後輸出。
+/// 預設 system prompt。user 可在 `~/.mori/ear.json` 的 `cleanup_prompt_file`
+/// 指向自己的 .md 檔覆寫(每次 cleanup live-read,改了不必重啟)。
+pub const DEFAULT_SYSTEM_PROMPT: &str = "你是 mori 語音輸入助理。把 STT 輸出的純文字做最小幅度校正後輸出。
 
 **第一條,最重要:輸出必須是 100% 繁體中文(台灣用語)**
 
@@ -66,7 +68,44 @@ struct MessageOut {
     content: String,
 }
 
-pub async fn cleanup(api_key: &str, raw: &str) -> Result<String> {
+/// 解析 cleanup prompt:`prompt_file` 空 / 檔不存在 / 讀失敗 → fallback default,
+/// 並 warn log。每次 cleanup 都重讀 — file IO trivial,user 改 prompt 不必重啟。
+/// 支援 `~/` 展開到 `$HOME`。
+pub fn resolve_system_prompt(prompt_file: &str) -> String {
+    if prompt_file.trim().is_empty() {
+        return DEFAULT_SYSTEM_PROMPT.to_string();
+    }
+    let path = expand_tilde(prompt_file);
+    match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) => {
+            tracing::warn!(
+                path = %path.display(),
+                "cleanup_prompt_file 是空檔,fallback 內建 prompt"
+            );
+            DEFAULT_SYSTEM_PROMPT.to_string()
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "讀 cleanup_prompt_file 失敗,fallback 內建 prompt"
+            );
+            DEFAULT_SYSTEM_PROMPT.to_string()
+        }
+    }
+}
+
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
+pub async fn cleanup(api_key: &str, raw: &str, system_prompt: &str) -> Result<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
@@ -76,7 +115,7 @@ pub async fn cleanup(api_key: &str, raw: &str) -> Result<String> {
         messages: vec![
             Message {
                 role: "system",
-                content: SYSTEM_PROMPT,
+                content: system_prompt,
             },
             Message {
                 role: "user",

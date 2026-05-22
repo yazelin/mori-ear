@@ -53,6 +53,19 @@ struct Config {
     /// 設 true → raw Whisper 直送 paste-back,省 200~500ms 跟一輪 token cost,但會有錯字 / 簡體。
     #[serde(default)]
     raw: bool,
+    /// cleanup system prompt 來源檔(`.md` / `.txt`)。空 = 用 cleanup::DEFAULT_SYSTEM_PROMPT。
+    /// 可指向 `~/.mori/voice_input/USER-00.純文字輸入.md` 跟 mori-desktop 共用。
+    /// 每次 cleanup live-read,改 prompt 不必重啟 mori-ear。
+    #[serde(default)]
+    cleanup_prompt_file: String,
+    /// 轉錄完是否貼進焦點視窗(預設 true,維持舊行為)。
+    /// 設 false → 只印 stdout,不碰 clipboard、不按 Ctrl+V — pipe 用法 / headless 場景適用。
+    #[serde(default = "default_paste_back")]
+    paste_back: bool,
+}
+
+fn default_paste_back() -> bool {
+    true
 }
 
 fn default_hotkey() -> String {
@@ -73,6 +86,8 @@ impl Config {
             groq_api_key: String::new(),
             language: String::new(),
             raw: false,
+            cleanup_prompt_file: String::new(),
+            paste_back: true,
         });
         if cfg.groq_api_key.is_empty() {
             if let Some(k) = Self::try_load_groq_key_from_mori(&mori_config_path()) {
@@ -255,13 +270,121 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    match run().await {
+    // 極簡 CLI 解析 — 不引入 clap,只認 `--input <file>` 跟 `--help`/`-h`。
+    // 沒參數 → 走原本的全域熱鍵 daemon 模式。
+    let args: Vec<String> = std::env::args().collect();
+    let result = match parse_cli(&args) {
+        CliMode::Help => {
+            print_help();
+            return ExitCode::SUCCESS;
+        }
+        CliMode::Batch(path) => batch(&path).await,
+        CliMode::Daemon => run().await,
+        CliMode::Error(msg) => {
+            eprintln!("mori-ear: {msg}\n");
+            print_help();
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match result {
         Ok(code) => code,
         Err(e) => {
             error!(error = ?e, "mori-ear exited with error");
             ExitCode::FAILURE
         }
     }
+}
+
+enum CliMode {
+    Daemon,
+    Batch(String),
+    Help,
+    Error(String),
+}
+
+fn parse_cli(args: &[String]) -> CliMode {
+    let mut i = 1;
+    let mut input: Option<String> = None;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => return CliMode::Help,
+            "--input" => {
+                let Some(v) = args.get(i + 1) else {
+                    return CliMode::Error("--input 需要 file path".into());
+                };
+                input = Some(v.clone());
+                i += 2;
+            }
+            other => return CliMode::Error(format!("未知參數:{other}")),
+        }
+    }
+    match input {
+        Some(p) => CliMode::Batch(p),
+        None => CliMode::Daemon,
+    }
+}
+
+fn print_help() {
+    eprintln!(
+        "mori-ear — Mori 的耳朵 / 語音輸入器官\n\
+         \n\
+         用法:\n\
+           mori-ear                  全域熱鍵 daemon 模式(預設,聽 Ctrl+Alt+E)\n\
+           mori-ear --input <file>   batch 模式:轉錄一個音檔 → cleanup → 印 stdout 後 exit\n\
+                                     (跳過 single-instance lock、不裝熱鍵、不 paste-back)\n\
+                                     支援 Groq Whisper 認的格式:wav/mp3/m4a/flac/webm/ogg\n\
+           mori-ear --help           印這段\n\
+         \n\
+         設定:`~/.mori/ear.json`(可選)— hotkey / cleanup_prompt_file / paste_back / raw 等\n\
+         API key:`~/.mori/config.json` 的 providers.groq.api_key 或 env GROQ_API_KEY"
+    );
+}
+
+/// Batch 模式:讀檔 → STT → cleanup(可選)→ 印 stdout → exit。
+/// 不裝 single-instance / 不裝 hotkey / 不 paste-back — 純 pipeline 工具。
+async fn batch(input_path: &str) -> Result<ExitCode> {
+    let cfg = Config::load();
+    let api_key = cfg
+        .resolved_api_key()
+        .context("GROQ_API_KEY 缺 — 設環境變數或寫進 ~/.mori/config.json 的 providers.groq.api_key")?;
+
+    info!(file = %input_path, "batch 模式 — 讀檔送 Whisper");
+    let bytes = std::fs::read(input_path)
+        .with_context(|| format!("讀 input file 失敗:{input_path}"))?;
+    if bytes.is_empty() {
+        anyhow::bail!("input file 是空檔:{input_path}");
+    }
+
+    let raw = stt::transcribe(&api_key, &cfg.language, bytes)
+        .await
+        .context("Whisper STT 失敗")?;
+
+    let text = if cfg.raw {
+        raw
+    } else {
+        let prompt = cleanup::resolve_system_prompt(&cfg.cleanup_prompt_file);
+        match cleanup::cleanup(&api_key, &raw, &prompt).await {
+            Ok(cleaned) => {
+                info!(
+                    raw_chars = raw.chars().count(),
+                    clean_chars = cleaned.chars().count(),
+                    "✓ cleanup OK"
+                );
+                cleaned
+            }
+            Err(e) => {
+                warn!(error = ?e, "cleanup 失敗,用 raw whisper output");
+                raw
+            }
+        }
+    };
+
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{}", text).context("write stdout")?;
+    out.flush().ok();
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn run() -> Result<ExitCode> {
@@ -314,6 +437,8 @@ async fn run() -> Result<ExitCode> {
     let api_key_arc = Arc::new(api_key);
     let lang_arc = Arc::new(cfg.language.clone());
     let raw_arc = Arc::new(cfg.raw);
+    let prompt_file_arc = Arc::new(cfg.cleanup_prompt_file.clone());
+    let paste_back_arc = Arc::new(cfg.paste_back);
 
     loop {
         tokio::select! {
@@ -330,6 +455,8 @@ async fn run() -> Result<ExitCode> {
                         api_key_arc.clone(),
                         lang_arc.clone(),
                         raw_arc.clone(),
+                        prompt_file_arc.clone(),
+                        paste_back_arc.clone(),
                     ).await;
                 }
             }
@@ -669,6 +796,8 @@ async fn handle_event(
     api_key: Arc<String>,
     language: Arc<String>,
     skip_cleanup: Arc<bool>,
+    cleanup_prompt_file: Arc<String>,
+    paste_back_enabled: Arc<bool>,
 ) {
     match ev.state {
         HotKeyState::Pressed => {
@@ -726,7 +855,8 @@ async fn handle_event(
                 let text = if *skip_cleanup {
                     raw
                 } else {
-                    match cleanup::cleanup(&api_key, &raw).await {
+                    let prompt = cleanup::resolve_system_prompt(&cleanup_prompt_file);
+                    match cleanup::cleanup(&api_key, &raw, &prompt).await {
                         Ok(cleaned) => {
                             info!(
                                 raw_chars = raw.chars().count(),
@@ -742,19 +872,24 @@ async fn handle_event(
                     }
                 };
 
-                // 預設:同時(a)印到 stdout 給 pipe 用、(b)用 enigo type 進焦點視窗 —
-                // user `mori-ear &` 背景跑一次就好,按熱鍵在哪個視窗就出在哪個視窗。
+                // (a) stdout 永遠印 — pipe 用法 / `mori-ear > log.txt` 都靠這
                 use std::io::Write as _;
                 let mut out = std::io::stdout().lock();
                 let _ = writeln!(out, "{}", text);
                 let _ = out.flush();
                 drop(out);
-                match paste_back(&text) {
-                    Ok(()) => info!(chars = text.chars().count(), "✓ 轉錄 + 貼回完成"),
-                    Err(e) => {
-                        warn!(error = ?e, "貼回失敗(stdout 還是有印,可自己抓)");
-                        info!(chars = text.chars().count(), "✓ 轉錄完成");
+
+                // (b) paste-back 可選 — config `paste_back: false` 跳過(headless / pure pipe 場景)
+                if *paste_back_enabled {
+                    match paste_back(&text) {
+                        Ok(()) => info!(chars = text.chars().count(), "✓ 轉錄 + 貼回完成"),
+                        Err(e) => {
+                            warn!(error = ?e, "貼回失敗(stdout 還是有印,可自己抓)");
+                            info!(chars = text.chars().count(), "✓ 轉錄完成");
+                        }
                     }
+                } else {
+                    info!(chars = text.chars().count(), "✓ 轉錄完成(paste-back 關閉,只印 stdout)");
                 }
             });
         }

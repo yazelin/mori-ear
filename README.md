@@ -236,7 +236,9 @@ gsettings reset org.gnome.settings-daemon.plugins.media-keys custom-keybindings 
   "hotkey": "Ctrl+Alt+E",
   "groq_api_key": "gsk_...",
   "language": "zh",
-  "raw": false
+  "raw": false,
+  "cleanup_prompt_file": "~/.mori/voice_input/USER-00.純文字輸入.md",
+  "paste_back": true
 }
 ```
 
@@ -244,8 +246,29 @@ gsettings reset org.gnome.settings-daemon.plugins.media-keys custom-keybindings 
 - `groq_api_key`:留空時 fallback 去 `~/.mori/config.json` 的 `providers.groq.api_key`(跟 mori-desktop 共用),再 fallback 環境變數 `GROQ_API_KEY`。
 - `language`:空 = 自動偵測。`zh` / `en` / 其他 ISO 639-1。
 - `raw`:`true` = 跳過 cleanup LLM,直接送 raw Whisper 輸出(省 ~200ms 跟一輪 token,但會有錯字 / 簡體)。
+- `cleanup_prompt_file`:cleanup LLM 的 system prompt 來源 `.md` / `.txt` 路徑(支援 `~/`)。空 / 檔不存在 → fallback 內建 prompt。**每次 cleanup live-read**,改 prompt 不必重啟 mori-ear。指向 `~/.mori/voice_input/USER-00.純文字輸入.md` 可跟 mori-desktop 共用同一份。
+- `paste_back`:`true`(預設)= 同時印 stdout + 貼進焦點視窗;`false` = 只印 stdout,不碰 clipboard、不按 Ctrl+V。pipe 用法 / headless / 不想干擾焦點視窗時設 `false`。
 
 只想覆寫一個欄位也行 — ear.json 沒寫的欄位會從 config.json / 預設補回來(partial merge)。
+
+### Batch / pipe 模式 `--input <file>`
+
+不按熱鍵、直接餵音檔轉成文字到 stdout:
+
+```sh
+mori-ear --input recording.wav
+# Whisper 接受的格式都吃:wav / mp3 / m4a / flac / webm / ogg
+# stderr 走 log,stdout 純粹輸出 transcript
+```
+
+跟 daemon 模式互不衝突 — batch 跳過 single-instance lock、不裝熱鍵、不 paste-back,純 pipeline 工具。
+適合場景:
+
+```sh
+mori-ear --input meeting.mp3 > meeting.txt          # 轉錄存檔
+mori-ear --input clip.wav | translate -t en         # 後續處理
+find ~/recordings -name '*.wav' -exec mori-ear --input {} \; > all.txt  # batch 全跑
+```
 
 ---
 

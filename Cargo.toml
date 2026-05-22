@@ -31,6 +31,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # parking_lot for low-overhead mutex(audio callback path)
 parking_lot = "0.12"
 
+# Linux-only:close fd 3..N 在 spawn child 前(pre_exec hook)。
+# 為什麼:`single-instance` crate 創 abstract Unix socket 時沒設 FD_CLOEXEC,
+# `xclip` 寫完 fork 為 daemon 持有 X11 selection、會繼承那個 socket fd,
+# 即使 mori-ear 被 kill,xclip 還在持 socket → 新 instance 啟動 SingleInstance::is_single()
+# 永遠 false。修法:spawn xclip/xdotool 前 close fd >= 3,擋掉 FD 洩漏。
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 # Windows-only:跟 mori-desktop 同一套,paste-back 改走 Win32 clipboard + SendInput Ctrl+V
 # (比 enigo text() 逐字 SCANCODE_UNICODE 快很多,長段落瞬間貼上)。
 #   - Win32_Foundation: HWND / HANDLE / CloseHandle

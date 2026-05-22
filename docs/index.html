@@ -43,6 +43,7 @@
   <div class="nav-right">
     <ul class="nav-links">
       <li><a href="#install">安裝</a></li>
+      <li><a href="#ear-wrapper">便利</a></li>
       <li><a href="#usage">使用</a></li>
       <li><a href="#config">設定</a></li>
       <li><a href="#support">平台支援</a></li>
@@ -159,6 +160,28 @@
     </article>
 
   </div>
+</section>
+
+<section class="ear-wrapper" id="ear-wrapper">
+  <h2 class="section-heading">Linux 便利:<code>ear</code> 一鍵 wrapper</h2>
+  <p class="section-sub">把「裝 / 啟 / 停 / 解除」收成一個指令 + GNOME 全域 toggle 快捷鍵。Linux + GNOME 主測;KDE / XFCE / Sway 自動 skip keybind 層,其他層照常 work。</p>
+
+  <div class="code-block" data-copy='git clone https://github.com/yazelin/mori-ear &amp;&amp; cd mori-ear &amp;&amp; ln -s "$PWD/scripts/ear.sh" ~/.local/bin/ear &amp;&amp; ear install'>
+    <pre><code><span class="tok-cmd">git</span> clone https://github.com/yazelin/mori-ear
+<span class="tok-cmd">cd</span> mori-ear
+<span class="tok-cmd">ln</span> <span class="tok-flag">-s</span> <span class="tok-str">"$PWD/scripts/ear.sh"</span> ~/.local/bin/ear
+<span class="tok-cmd">ear</span> install</code></pre>
+    <button class="copy-btn" type="button" aria-label="複製">複製</button>
+  </div>
+  <p class="section-sub" style="margin-top:14px"><code>ear install</code> 自動跑 <strong>cargo install + XDG autostart + GNOME 快捷鍵 + 啟動</strong> 四層,idempotent — 已裝的會跳過。</p>
+
+  <ul class="config-notes">
+    <li><code>ear</code>(無參數) — toggle on/off,等同按 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>E</kbd></li>
+    <li><code>ear on / off / status / log</code> — 明確開關、看 process + 各層安裝狀態、tail log</li>
+    <li><code>ear autostart on|off</code> — 只動開機自動啟用(不動 binary / 快捷鍵)</li>
+    <li><code>ear keybind on|off</code> — 只動 GNOME Ctrl+Shift+Alt+E 快捷鍵(不動其他層)</li>
+    <li><code>ear uninstall</code> — 反過來全套拆(會確認;<code>--yes</code> 跳過 prompt)</li>
+  </ul>
 </section>
 
 <section class="usage" id="usage">

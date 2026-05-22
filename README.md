@@ -130,6 +130,42 @@ mori-ear &
 
 ---
 
+## Linux 便利:`ear` 一鍵 wrapper(選用)
+
+`scripts/ear.sh` 把「開/關/狀態/一鍵裝/一鍵拆/綁 GNOME 快捷鍵」全包成單一 `ear` 指令。clone 完 repo 後:
+
+```sh
+# 1. symlink 進 PATH(repo 根目錄)
+ln -s "$PWD/scripts/ear.sh" ~/.local/bin/ear
+
+# 2. 一鍵全套裝 — 已裝的會跳過,idempotent
+ear install
+```
+
+`ear install` 會做四件事(任一已裝就 skip):
+1. `cargo install --path .` 編譯 + 裝 binary
+2. `bash scripts/install-autostart.sh` 寫 XDG autostart entry
+3. `gsettings` 綁 Ctrl+Shift+Alt+E → `ear toggle`(GNOME)
+4. nohup 啟動 process
+
+日常用:
+
+```sh
+ear              # toggle(沒跑就開、跑就停)— 跟 Ctrl+Shift+Alt+E 同等
+ear on / off     # 明確開 / 關
+ear status       # 看 process + 各層安裝狀態
+ear log          # tail /tmp/mori-ear.err
+ear keybind on|off    # 只動 GNOME 快捷鍵
+ear autostart on|off  # 只動開機自動啟用
+ear uninstall    # 反過來全套拆(會問你確認;`ear uninstall --yes` 跳過)
+```
+
+需要 `python3` + `gsettings` + `notify-send`(Ubuntu / Fedora / Arch 預設都有)。非 GNOME 桌面 keybind 段自動 skip,其他層照常 work。
+
+預設快捷鍵 `<Ctrl><Shift><Alt>e`,要換改 `scripts/ear.sh` 頂端 `GS_BINDING` 後重跑 `ear keybind off && ear keybind on`。
+
+---
+
 ## 解除安裝
 
 ### Windows
@@ -156,6 +192,8 @@ Remove-Item "$env:USERPROFILE\.mori\ear.json" -ErrorAction SilentlyContinue
 
 ### Linux
 
+裝過 `ear` wrapper 的話一句 `ear uninstall` 全套拆完(會問你確認)。手動版:
+
 ```sh
 # 1. 移除 XDG autostart entry
 bash scripts/install-autostart.sh --remove
@@ -168,6 +206,10 @@ rm ~/.cargo/bin/mori-ear   # 或 sudo rm /usr/local/bin/mori-ear
 
 # 4. (選)刪設定
 rm -f ~/.mori/ear.json     # config.json 共用,別刪
+
+# 5. (選,有裝 ear wrapper)
+rm -f ~/.local/bin/ear
+gsettings reset org.gnome.settings-daemon.plugins.media-keys custom-keybindings  # 注意這會清掉所有自訂快捷鍵
 ```
 
 ---

@@ -4,7 +4,9 @@ For Claude / agents working in this repo. README.md is the human-facing entry po
 
 ## What this is
 
-A minimal Rust CLI: global hotkey → microphone capture → Groq Whisper STT → Groq LLM cleanup → clipboard + Ctrl+V paste-back into the focused window. No GUI, no tray, no persistent state. The "ear" organ in the Mori universe — runs as an independent process so mori-desktop restarts don't kill voice input.
+A minimal Rust CLI: global hotkey → microphone capture → STT → Groq LLM cleanup → clipboard + Ctrl+V paste-back into the focused window. No GUI, no tray, no persistent state. The "ear" organ in the Mori universe — runs as an independent process so mori-desktop restarts don't kill voice input.
+
+STT has two backends (config `backend`, default `auto`): **Groq Whisper API** (cloud, fast) and a **local whisper-server** (the shared `~/.mori/whisper-server.json` discovery contract — see `src/local_stt.rs`). `auto` prefers Groq, falls back to local on Groq failure or when there's no Groq key; `groq` / `local` force one. mori-ear is a read-only **Adopter** of the local server (never starts/writes it — that's the Starter's job, today mori-meeting-recorder). Cleanup stays Groq; offline (no key) → STT goes local + cleanup is skipped (raw output).
 
 ## Layout
 
@@ -74,6 +76,10 @@ Order (partial merge):
 3. `GROQ_API_KEY` env var — final fallback
 
 Old behavior was "ear.json wins entirely or nothing" — a user writing a one-line ear.json to override hotkey lost the groq key and the process died. Don't regress this; the partial-merge logic in `Config::load` is small but load-bearing.
+
+### STT backend selection (`backend`)
+
+`ear.json` `backend` ∈ `auto` (default) | `groq` | `local`. Since `auto`/`local` can run without a Groq key, startup no longer hard-requires the key — it only bails when `backend = "groq"` and no key is resolvable. The local path reads `~/.mori/whisper-server.json`, verifies alive (loopback + `GET /` 200), **resamples to 16kHz mono** (whisper.cpp needs it; Groq resamples server-side so its path is untouched), then POSTs `/inference`. Security in `local_stt.rs` mirrors AgentOS whisper_client: loopback host pin, `redirect(none)`, `no_proxy()`, 512MB WAV cap.
 
 ## Audio guardrails (why STT might be skipped)
 

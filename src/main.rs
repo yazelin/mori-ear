@@ -34,6 +34,7 @@ use tracing::{error, info, warn};
 
 mod audio;
 mod cleanup;
+mod local_stt;
 mod stt;
 
 const DEFAULT_HOTKEY: &str = "Ctrl+Alt+E";
@@ -62,10 +63,18 @@ struct Config {
     /// 設 false → 只印 stdout,不碰 clipboard、不按 Ctrl+V — pipe 用法 / headless 場景適用。
     #[serde(default = "default_paste_back")]
     paste_back: bool,
+    /// STT backend:`auto`(預設,Groq 優先、失敗/無 key → 本地 whisper-server)
+    /// / `groq`(只 Groq)/ `local`(只本地 whisper-server,隱私、不碰 Groq)。
+    #[serde(default = "default_backend")]
+    backend: String,
 }
 
 fn default_paste_back() -> bool {
     true
+}
+
+fn default_backend() -> String {
+    "auto".into()
 }
 
 fn default_hotkey() -> String {
@@ -88,6 +97,7 @@ impl Config {
             raw: false,
             cleanup_prompt_file: String::new(),
             paste_back: true,
+            backend: default_backend(),
         });
         if cfg.groq_api_key.is_empty() {
             if let Some(k) = Self::try_load_groq_key_from_mori(&mori_config_path()) {
@@ -126,7 +136,7 @@ impl Config {
 /// - Windows:`%USERPROFILE%`(沒設 `HOME` 時 fallback,跟 mori-desktop 同套)
 /// 兩個都缺 → 回空 path,下游 read_to_string 就讓它正常失敗
 /// (config 缺也能跑,只要 `GROQ_API_KEY` env 有設)
-fn home_dir() -> std::path::PathBuf {
+pub(crate) fn home_dir() -> std::path::PathBuf {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map(std::path::PathBuf::from)
@@ -341,30 +351,65 @@ fn print_help() {
     );
 }
 
+/// STT backend 選擇 + fallback。`auto`:有 key 先 Groq,Groq 失敗 → 本地 whisper-server;
+/// 無 key → 直接本地。`groq`/`local` 強制單一 backend。
+/// 註:本地路徑需可解碼的 WAV(daemon 路徑由 audio.rs 產 WAV;batch 餵 mp3/m4a 等非 WAV
+/// 時本地會在 resample 階段失敗 → auto 模式下視同本地不可用)。
+async fn transcribe_with_fallback(
+    backend: &str,
+    api_key: Option<&str>,
+    language: &str,
+    wav: Vec<u8>,
+) -> Result<String> {
+    match backend {
+        "groq" => {
+            let key = api_key.context("backend=groq 但無 Groq API key")?;
+            stt::transcribe(key, language, wav).await
+        }
+        "local" => local_stt::transcribe_default(language, wav).await,
+        _ => {
+            if let Some(key) = api_key {
+                match stt::transcribe(key, language, wav.clone()).await {
+                    Ok(t) => Ok(t),
+                    Err(e) => {
+                        warn!(error = ?e, "Groq STT 失敗 → fallback 本地 whisper-server");
+                        local_stt::transcribe_default(language, wav).await
+                    }
+                }
+            } else {
+                info!("無 Groq key → 走本地 whisper-server");
+                local_stt::transcribe_default(language, wav).await
+            }
+        }
+    }
+}
+
 /// Batch 模式:讀檔 → STT → cleanup(可選)→ 印 stdout → exit。
 /// 不裝 single-instance / 不裝 hotkey / 不 paste-back — 純 pipeline 工具。
 async fn batch(input_path: &str) -> Result<ExitCode> {
     let cfg = Config::load();
-    let api_key = cfg
-        .resolved_api_key()
-        .context("GROQ_API_KEY 缺 — 設環境變數或寫進 ~/.mori/config.json 的 providers.groq.api_key")?;
+    let api_key = cfg.resolved_api_key();
+    if cfg.backend == "groq" && api_key.is_none() {
+        anyhow::bail!("backend=groq 但無 Groq API key — 設 GROQ_API_KEY / config.json,或把 backend 設成 auto/local");
+    }
 
-    info!(file = %input_path, "batch 模式 — 讀檔送 Whisper");
+    info!(file = %input_path, backend = %cfg.backend, "batch 模式 — 讀檔送 STT");
     let bytes = std::fs::read(input_path)
         .with_context(|| format!("讀 input file 失敗:{input_path}"))?;
     if bytes.is_empty() {
         anyhow::bail!("input file 是空檔:{input_path}");
     }
 
-    let raw = stt::transcribe(&api_key, &cfg.language, bytes)
+    let raw = transcribe_with_fallback(&cfg.backend, api_key.as_deref(), &cfg.language, bytes)
         .await
-        .context("Whisper STT 失敗")?;
+        .context("STT 失敗")?;
 
-    let text = if cfg.raw {
+    let text = if cfg.raw || api_key.is_none() {
         raw
     } else {
+        let key = api_key.as_deref().unwrap();
         let prompt = cleanup::resolve_system_prompt(&cfg.cleanup_prompt_file);
-        match cleanup::cleanup(&api_key, &raw, &prompt).await {
+        match cleanup::cleanup(key, &raw, &prompt).await {
             Ok(cleaned) => {
                 info!(
                     raw_chars = raw.chars().count(),
@@ -411,12 +456,15 @@ async fn run() -> Result<ExitCode> {
     }
 
     let cfg = Config::load();
-    let api_key = cfg
-        .resolved_api_key()
-        .context("GROQ_API_KEY 缺 — 設環境變數或寫進 ~/.mori/config.json 的 providers.groq.api_key")?;
+    let api_key = cfg.resolved_api_key();
+    if cfg.backend == "groq" && api_key.is_none() {
+        anyhow::bail!(
+            "backend=groq 但無 Groq API key — 設 GROQ_API_KEY / 寫進 ~/.mori/config.json 的 providers.groq.api_key,或把 backend 設成 auto/local"
+        );
+    }
     let hotkey = parse_hotkey(&cfg.hotkey).with_context(|| format!("parse hotkey: {}", cfg.hotkey))?;
 
-    info!(hotkey = %cfg.hotkey, "mori-ear ready — 按住熱鍵說話、放開停止");
+    info!(hotkey = %cfg.hotkey, backend = %cfg.backend, "mori-ear ready — 按住熱鍵說話、放開停止");
 
     // global-hotkey 0.6 在 Windows 上把 RegisterHotKey 綁到 hidden window,WM_HOTKEY
     // 進 thread queue 後**需要那條 thread 自己 pump message** WindowProc 才會被呼叫。
@@ -434,11 +482,12 @@ async fn run() -> Result<ExitCode> {
     tokio::pin!(shutdown);
 
     let rx = GlobalHotKeyEvent::receiver();
-    let api_key_arc = Arc::new(api_key);
+    let api_key_arc = Arc::new(api_key); // Arc<Option<String>>:無 key 時走本地 backend
     let lang_arc = Arc::new(cfg.language.clone());
     let raw_arc = Arc::new(cfg.raw);
     let prompt_file_arc = Arc::new(cfg.cleanup_prompt_file.clone());
     let paste_back_arc = Arc::new(cfg.paste_back);
+    let backend_arc = Arc::new(cfg.backend.clone());
 
     loop {
         tokio::select! {
@@ -457,6 +506,7 @@ async fn run() -> Result<ExitCode> {
                         raw_arc.clone(),
                         prompt_file_arc.clone(),
                         paste_back_arc.clone(),
+                        backend_arc.clone(),
                     ).await;
                 }
             }
@@ -790,14 +840,16 @@ fn needs_shift_for_paste_windows(process_name: &str) -> bool {
     .any(|t| p.contains(t))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_event(
     ev: GlobalHotKeyEvent,
     recorder: Arc<Mutex<Option<audio::Recorder>>>,
-    api_key: Arc<String>,
+    api_key: Arc<Option<String>>,
     language: Arc<String>,
     skip_cleanup: Arc<bool>,
     cleanup_prompt_file: Arc<String>,
     paste_back_enabled: Arc<bool>,
+    backend: Arc<String>,
 ) {
     match ev.state {
         HotKeyState::Pressed => {
@@ -842,21 +894,21 @@ async fn handle_event(
             info!(bytes = wav.len(), duration_secs, rms_db, "錄音停止,送 STT");
             // STT 在 spawn 跑,主 loop 不卡
             tokio::spawn(async move {
-                let raw = match stt::transcribe(&api_key, &language, wav).await {
+                let raw = match transcribe_with_fallback(&backend, api_key.as_deref(), &language, wav).await {
                     Ok(t) => t,
                     Err(e) => {
-                        error!(error = ?e, "STT 失敗");
+                        error!(error = ?e, "STT 失敗(Groq + 本地 whisper-server 都不行)");
                         return;
                     }
                 };
 
-
-                // Step 2:LLM cleanup(繁中校正 + 標點 + 簡轉繁)。失敗 fallback raw。
+                // Step 2:LLM cleanup(繁中校正 + 標點 + 簡轉繁)。需 Groq key;
+                // skip_cleanup 或無 key(離線)→ 直接用 raw。cleanup 失敗也 fallback raw。
                 let text = if *skip_cleanup {
                     raw
-                } else {
+                } else if let Some(key) = api_key.as_deref() {
                     let prompt = cleanup::resolve_system_prompt(&cleanup_prompt_file);
-                    match cleanup::cleanup(&api_key, &raw, &prompt).await {
+                    match cleanup::cleanup(key, &raw, &prompt).await {
                         Ok(cleaned) => {
                             info!(
                                 raw_chars = raw.chars().count(),
@@ -870,6 +922,9 @@ async fn handle_event(
                             raw
                         }
                     }
+                } else {
+                    info!("無 Groq key,跳過 cleanup,用 raw whisper output");
+                    raw
                 };
 
                 // (a) stdout 永遠印 — pipe 用法 / `mori-ear > log.txt` 都靠這

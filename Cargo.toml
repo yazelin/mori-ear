@@ -62,6 +62,10 @@ windows = { version = "0.58", features = [
     "Win32_System_Console",
 ] }
 
+[dev-dependencies]
+# 本地 whisper-server fallback 的 stub server(測試用,對齊 AgentOS 的證法)
+tiny_http = "0.12"
+
 [profile.release]
 opt-level = "z"
 lto = true

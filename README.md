@@ -238,7 +238,12 @@ gsettings reset org.gnome.settings-daemon.plugins.media-keys custom-keybindings 
   "language": "zh",
   "raw": false,
   "cleanup_prompt_file": "~/.mori/voice_input/USER-00.純文字輸入.md",
-  "paste_back": true
+  "paste_back": true,
+  "voice_input": {
+    "trim_silence_enabled": true,
+    "trim_silence_min_ms": 300,
+    "trim_silence_threshold": 0.02
+  }
 }
 ```
 
@@ -248,6 +253,7 @@ gsettings reset org.gnome.settings-daemon.plugins.media-keys custom-keybindings 
 - `raw`:`true` = 跳過 cleanup LLM,直接送 raw Whisper 輸出(省 ~200ms 跟一輪 token,但會有錯字 / 簡體)。
 - `cleanup_prompt_file`:cleanup LLM 的 system prompt 來源 `.md` / `.txt` 路徑(支援 `~/`)。空 / 檔不存在 → fallback 內建 prompt。**每次 cleanup live-read**,改 prompt 不必重啟 mori-ear。指向 `~/.mori/voice_input/USER-00.純文字輸入.md` 可跟 mori-desktop 共用同一份。
 - `paste_back`:`true`(預設)= 同時印 stdout + 貼進焦點視窗;`false` = 只印 stdout,不碰 clipboard、不按 Ctrl+V。pipe 用法 / headless / 不想干擾焦點視窗時設 `false`。
+- `voice_input`:送 STT 前的靜音剪裁(對齊 mori-desktop 的 `config.json` `voice_input.*`)。`trim_silence_enabled`(預設 `true`)剪掉**首尾靜音 + 中間連續停頓 ≥ `trim_silence_min_ms`**(預設 300ms,短停頓留著給 Whisper 斷句)。`trim_silence_threshold`(預設 0.02,線性振幅 ≈ -34 dBFS)是「多大才算有聲」。設 `trim_silence_enabled: false` → 整段原樣送(舊行為)。**剪裁不影響** duration/RMS 跳過守門(那個用剪裁前整段算)。
 
 只想覆寫一個欄位也行 — ear.json 沒寫的欄位會從 config.json / 預設補回來(partial merge)。
 
@@ -306,7 +312,7 @@ mori-ear 是 Mori 宇宙的「**第一個器官**」— 從 mori-desktop(身體)
 
 - 沒 GUI / tray icon
 - 沒 voice profile / 校正詞庫
-- 沒 VAD / noise gate / silence trim(只有最低限度的 duration + RMS 守門員)
+- 沒 VAD / noise gate(但**有**送 STT 前的靜音剪裁 + duration/RMS 守門員,見「設定」的 `voice_input`)
 - 沒持久化錄音檔(audio 用完丟,只留 transcript)
 
 這些在 mori-desktop 那邊。`mori-ear` 是極簡版,只負責「聽聲音 → 變字 → 貼進焦點視窗」。

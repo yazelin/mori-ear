@@ -67,6 +67,56 @@ struct Config {
     /// / `groq`(只 Groq)/ `local`(只本地 whisper-server,隱私、不碰 Groq)。
     #[serde(default = "default_backend")]
     backend: String,
+    /// 送 STT 前的靜音剪裁(對齊 mori-desktop `config.json` 的 `voice_input.*`)。
+    /// ear.json 沒寫整段 → 用預設(剪裁開、min_ms=300、threshold=0.02)。
+    #[serde(default)]
+    voice_input: VoiceInputConfig,
+}
+
+/// 靜音剪裁設定(ear.json `voice_input.trim_silence_*`,形狀對齊 mori-desktop)。
+#[derive(Debug, Clone, Deserialize)]
+struct VoiceInputConfig {
+    /// 送 STT 前剪首尾 + 中間連續靜音(預設 true)。
+    #[serde(default = "default_trim_enabled")]
+    trim_silence_enabled: bool,
+    /// 中間連續靜音 ≥ 此毫秒才壓掉(預設 300,對齊 mori-desktop)。
+    #[serde(default = "default_trim_min_ms")]
+    trim_silence_min_ms: u32,
+    /// 線性振幅門檻(預設 0.02 ≈ -34 dBFS,對齊 mori-desktop)。
+    #[serde(default = "default_trim_threshold")]
+    trim_silence_threshold: f32,
+}
+
+fn default_trim_enabled() -> bool {
+    true
+}
+
+fn default_trim_min_ms() -> u32 {
+    300
+}
+
+fn default_trim_threshold() -> f32 {
+    0.02
+}
+
+impl Default for VoiceInputConfig {
+    fn default() -> Self {
+        Self {
+            trim_silence_enabled: default_trim_enabled(),
+            trim_silence_min_ms: default_trim_min_ms(),
+            trim_silence_threshold: default_trim_threshold(),
+        }
+    }
+}
+
+impl VoiceInputConfig {
+    fn to_trim(&self) -> audio::TrimConfig {
+        audio::TrimConfig {
+            enabled: self.trim_silence_enabled,
+            threshold: self.trim_silence_threshold,
+            min_silence_ms: self.trim_silence_min_ms,
+        }
+    }
 }
 
 fn default_paste_back() -> bool {
@@ -98,6 +148,7 @@ impl Config {
             cleanup_prompt_file: String::new(),
             paste_back: true,
             backend: default_backend(),
+            voice_input: VoiceInputConfig::default(),
         });
         if cfg.groq_api_key.is_empty() {
             if let Some(k) = Self::try_load_groq_key_from_mori(&mori_config_path()) {
@@ -488,6 +539,7 @@ async fn run() -> Result<ExitCode> {
     let prompt_file_arc = Arc::new(cfg.cleanup_prompt_file.clone());
     let paste_back_arc = Arc::new(cfg.paste_back);
     let backend_arc = Arc::new(cfg.backend.clone());
+    let trim_cfg = cfg.voice_input.to_trim(); // Copy,每輪傳值即可
 
     loop {
         tokio::select! {
@@ -507,6 +559,7 @@ async fn run() -> Result<ExitCode> {
                         prompt_file_arc.clone(),
                         paste_back_arc.clone(),
                         backend_arc.clone(),
+                        trim_cfg,
                     ).await;
                 }
             }
@@ -850,6 +903,7 @@ async fn handle_event(
     cleanup_prompt_file: Arc<String>,
     paste_back_enabled: Arc<bool>,
     backend: Arc<String>,
+    trim: audio::TrimConfig,
 ) {
     match ev.state {
         HotKeyState::Pressed => {
@@ -871,7 +925,7 @@ async fn handle_event(
             let Some(r) = r else {
                 return;
             };
-            let (wav, duration_secs, rms_db) = match r.stop_and_encode_wav() {
+            let (wav, duration_secs, rms_db) = match r.stop_and_encode_wav(trim) {
                 Ok(w) => w,
                 Err(e) => {
                     error!(error = ?e, "WAV 編碼失敗");

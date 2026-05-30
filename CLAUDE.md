@@ -83,12 +83,28 @@ Old behavior was "ear.json wins entirely or nothing" — a user writing a one-li
 
 ## Audio guardrails (why STT might be skipped)
 
-`handle_event` (Released branch) bails on:
+Two separate mechanisms — don't conflate them:
+
+**(a) Whole-clip skip** — `handle_event` (Released branch) bails on:
 
 - `duration_secs < 0.25` — hotkey press too brief, treated as a misfire
 - `rms_db < -45.0` — recording is essentially silence, would trigger Whisper hallucinations ("謝謝", "請訂閱", etc.)
 
-Tune in `src/main.rs` constants `MIN_DURATION` / `MIN_RMS_DB`. The thresholds intentionally trade off some "very quiet whisper" sensitivity for not pasting YouTube end-credit hallucinations.
+Tune in `src/main.rs` constants `MIN_DURATION` / `MIN_RMS_DB`. The thresholds intentionally trade off some "very quiet whisper" sensitivity for not pasting YouTube end-credit hallucinations. **These run on the pre-trim full-clip RMS/duration** (returned by `stop_and_encode_wav`), so trimming does NOT change skip behavior.
+
+**(b) Silence trimming** — `audio.rs::apply_trim` cuts **leading/trailing silence (any length) + internal continuous pauses ≥ `min_silence_ms`** from the WAV *before* it's sent to STT (shorter upload, fewer edge hallucinations). Frame-RMS (20ms windows) over the downmixed mono, ported from mori-desktop's `recording.rs::trim_silence_runs`. Edges keep ~80ms padding so soft onsets aren't clipped; if the whole clip reads as silence, trimming is skipped and the full clip is sent (the whole-clip guard above then decides). Config-gated via `ear.json` `voice_input.*`:
+
+```jsonc
+{
+  "voice_input": {
+    "trim_silence_enabled": true,   // false → send full clip, old behavior
+    "trim_silence_min_ms": 300,     // internal pause ≥ this is removed (clamped via serde defaults)
+    "trim_silence_threshold": 0.02  // linear amplitude, 0.02 ≈ -34 dBFS — same defaults as mori-desktop
+  }
+}
+```
+
+Internal-pause removal is intentionally conservative (only ≥300ms) so Whisper keeps natural pauses as sentence-boundary cues. The skip gate still uses **average** RMS (not mori-desktop's peak-RMS-over-100ms-window upgrade) — a known limitation if you say a few words then leave a long silent tail.
 
 ## CI / release
 

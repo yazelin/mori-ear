@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "id": "mori.ear",
+  "name": "Mori Ear",
+  "kind": "local_service",
+  "description": "Mori 宇宙的「耳朵」器官:全域熱鍵語音輸入(錄音→STT→繁中 cleanup→貼回焦點視窗),並對外開一個受治理的 STT 轉譯服務(POST /inference)。獨立 process,mori-desktop 重啟不影響。",
+  "entrypoints": {
+    "cli": "mori-ear",
+    "local_api": "~/.mori/mori-ear-server.json"
+  },
+  "interfaces": [
+    {
+      "name": "transcribe",
+      "transport": "http",
+      "url": "/inference"
+    },
+    {
+      "name": "health",
+      "transport": "http",
+      "url": "/"
+    }
+  ],
+  "capabilities": [
+    "audio.capture.mic",
+    "voice.transcribe"
+  ],
+  "permissions": [],
+  "data_policy": {
+    "owns_raw_data": false,
+    "default_ingestion": "off"
+  }
+}

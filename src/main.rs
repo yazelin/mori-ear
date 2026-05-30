@@ -35,7 +35,10 @@ use tracing::{error, info, warn};
 mod audio;
 mod cleanup;
 mod local_stt;
+mod multipart;
+mod service;
 mod stt;
+mod watchdog;
 
 const DEFAULT_HOTKEY: &str = "Ctrl+Alt+E";
 
@@ -71,6 +74,42 @@ struct Config {
     /// ear.json 沒寫整段 → 用預設(剪裁開、min_ms=300、threshold=0.02)。
     #[serde(default)]
     voice_input: VoiceInputConfig,
+    /// 一次轉譯(STT+cleanup)的整體上限秒數 —— 看門狗。逾時就放棄該句、不卡死 daemon。
+    /// 預設 90s(對 hotkey 短句很寬鬆;長批次檔要轉很久可調大)。
+    #[serde(default = "default_transcribe_timeout_secs")]
+    transcribe_timeout_secs: u64,
+    /// 對外轉譯服務(HTTP `GET /` 驗活、`POST /inference`)。預設開,
+    /// 讓 AgentOS(http-service skill)/ mori-desktop 能當 client 消費 ear 的轉錄能力。
+    #[serde(default)]
+    service: ServiceConfig,
+}
+
+/// 對外 HTTP 轉譯服務設定(ear.json `service.*`)。
+#[derive(Debug, Clone, Deserialize)]
+struct ServiceConfig {
+    /// 是否開服務(預設開)。headless / 純 pipe 場景可設 false 關掉,回到「只有 hotkey」的極簡。
+    #[serde(default = "default_service_enabled")]
+    enabled: bool,
+    /// 綁定 port,0 = 由 OS 配 ephemeral(預設,寫進 descriptor 給 client 發現)。
+    #[serde(default)]
+    port: u16,
+}
+
+fn default_service_enabled() -> bool {
+    true
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_service_enabled(),
+            port: 0,
+        }
+    }
+}
+
+fn default_transcribe_timeout_secs() -> u64 {
+    90
 }
 
 /// 靜音剪裁設定(ear.json `voice_input.trim_silence_*`,形狀對齊 mori-desktop)。
@@ -149,6 +188,8 @@ impl Config {
             paste_back: true,
             backend: default_backend(),
             voice_input: VoiceInputConfig::default(),
+            transcribe_timeout_secs: default_transcribe_timeout_secs(),
+            service: ServiceConfig::default(),
         });
         if cfg.groq_api_key.is_empty() {
             if let Some(k) = Self::try_load_groq_key_from_mori(&mori_config_path()) {
@@ -340,6 +381,7 @@ async fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         CliMode::Batch(path) => batch(&path).await,
+        CliMode::Serve => serve_only().await,
         CliMode::Daemon => run().await,
         CliMode::Error(msg) => {
             eprintln!("mori-ear: {msg}\n");
@@ -360,6 +402,10 @@ async fn main() -> ExitCode {
 enum CliMode {
     Daemon,
     Batch(String),
+    /// 純轉譯服務模式(無 hotkey、無 hotkey single-instance):只開 HTTP `/inference` + 寫
+    /// descriptor。給 mori-desktop / AgentOS 在「需要時自動拉起」用(像 whisper-server 的
+    /// lazy-spawn);已有在線服務時自動讓位、直接 exit。
+    Serve,
     Help,
     Error(String),
 }
@@ -370,6 +416,7 @@ fn parse_cli(args: &[String]) -> CliMode {
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => return CliMode::Help,
+            "--serve" => return CliMode::Serve,
             "--input" => {
                 let Some(v) = args.get(i + 1) else {
                     return CliMode::Error("--input 需要 file path".into());
@@ -391,7 +438,10 @@ fn print_help() {
         "mori-ear — Mori 的耳朵 / 語音輸入器官\n\
          \n\
          用法:\n\
-           mori-ear                  全域熱鍵 daemon 模式(預設,聽 Ctrl+Alt+E)\n\
+           mori-ear                  全域熱鍵 daemon 模式(預設,聽 Ctrl+Alt+E,同時開轉譯服務)\n\
+           mori-ear --serve          純轉譯服務模式:只開 HTTP /inference + 寫 descriptor,\n\
+                                     無熱鍵、無 hotkey single-instance。給 mori-desktop /\n\
+                                     AgentOS 在需要時自動拉起;已有在線服務時自動讓位 exit\n\
            mori-ear --input <file>   batch 模式:轉錄一個音檔 → cleanup → 印 stdout 後 exit\n\
                                      (跳過 single-instance lock、不裝熱鍵、不 paste-back)\n\
                                      支援 Groq Whisper 認的格式:wav/mp3/m4a/flac/webm/ogg\n\
@@ -402,11 +452,12 @@ fn print_help() {
     );
 }
 
-/// STT backend 選擇 + fallback。`auto`:有 key 先 Groq,Groq 失敗 → 本地 whisper-server;
-/// 無 key → 直接本地。`groq`/`local` 強制單一 backend。
+/// STT backend 選擇 + fallback。`auto`:**本機優先** — 先試本地 whisper-server,
+/// 本地不可用(server 沒起來 / WAV 不可解)才退 Groq(有 key 時);無 key → 只走本地。
+/// `groq`/`local` 強制單一 backend。
 /// 註:本地路徑需可解碼的 WAV(daemon 路徑由 audio.rs 產 WAV;batch 餵 mp3/m4a 等非 WAV
-/// 時本地會在 resample 階段失敗 → auto 模式下視同本地不可用)。
-async fn transcribe_with_fallback(
+/// 時本地會在 resample 階段失敗 → auto 模式下退回 Groq)。
+pub(crate) async fn transcribe_with_fallback(
     backend: &str,
     api_key: Option<&str>,
     language: &str,
@@ -415,21 +466,22 @@ async fn transcribe_with_fallback(
     match backend {
         "groq" => {
             let key = api_key.context("backend=groq 但無 Groq API key")?;
+            info!(backend = "groq", "STT 走 Groq 雲端 Whisper");
             stt::transcribe(key, language, wav).await
         }
         "local" => local_stt::transcribe_default(language, wav).await,
         _ => {
-            if let Some(key) = api_key {
-                match stt::transcribe(key, language, wav.clone()).await {
-                    Ok(t) => Ok(t),
-                    Err(e) => {
-                        warn!(error = ?e, "Groq STT 失敗 → fallback 本地 whisper-server");
-                        local_stt::transcribe_default(language, wav).await
+            // auto:本機優先。本地 whisper-server 拿得到就用(音檔不離機,資料主權);
+            // 本地失敗(server 沒起來 / 非 WAV 不可 resample)才退 Groq(有 key 時)。
+            match local_stt::transcribe_default(language, wav.clone()).await {
+                Ok(t) => Ok(t),
+                Err(e_local) => match api_key {
+                    Some(key) => {
+                        warn!(error = ?e_local, "本地 whisper-server 不可用 → fallback Groq");
+                        stt::transcribe(key, language, wav).await
                     }
-                }
-            } else {
-                info!("無 Groq key → 走本地 whisper-server");
-                local_stt::transcribe_default(language, wav).await
+                    None => Err(e_local),
+                },
             }
         }
     }
@@ -451,9 +503,14 @@ async fn batch(input_path: &str) -> Result<ExitCode> {
         anyhow::bail!("input file 是空檔:{input_path}");
     }
 
-    let raw = transcribe_with_fallback(&cfg.backend, api_key.as_deref(), &cfg.language, bytes)
-        .await
-        .context("STT 失敗")?;
+    let timeout = Duration::from_secs(cfg.transcribe_timeout_secs);
+    let raw = watchdog::guard(
+        timeout,
+        "batch:STT",
+        transcribe_with_fallback(&cfg.backend, api_key.as_deref(), &cfg.language, bytes),
+    )
+    .await
+    .context("STT 失敗")?;
 
     let text = if cfg.raw || api_key.is_none() {
         raw
@@ -480,6 +537,35 @@ async fn batch(input_path: &str) -> Result<ExitCode> {
     let mut out = std::io::stdout().lock();
     writeln!(out, "{}", text).context("write stdout")?;
     out.flush().ok();
+    Ok(ExitCode::SUCCESS)
+}
+
+/// 純轉譯服務模式(`--serve`):只開 HTTP `/inference` + 寫 descriptor,無 hotkey、
+/// 無 hotkey single-instance lock。給 mori-desktop / AgentOS 在「需要時自動拉起」用
+/// (lazy-spawn,像 whisper-server)。已偵測到在線的 mori-ear 服務 → 讓位、直接 exit,
+/// 避免雙開雙寫 descriptor。
+async fn serve_only() -> Result<ExitCode> {
+    let cfg = Config::load();
+    if service::existing_service_alive().await {
+        info!("已偵測到在線的 mori-ear 轉譯服務,--serve 讓位、直接退出(不重複啟動)");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let _service = service::serve(
+        tokio::runtime::Handle::current(),
+        service::ServiceParams {
+            backend: cfg.backend.clone(),
+            api_key: cfg.resolved_api_key(),
+            language: cfg.language.clone(),
+            cleanup_prompt_file: cfg.cleanup_prompt_file.clone(),
+            skip_cleanup_default: cfg.raw,
+            timeout: Duration::from_secs(cfg.transcribe_timeout_secs),
+        },
+        cfg.service.port,
+    )
+    .context("啟動 serve-only 轉譯服務")?;
+    info!("mori-ear --serve:純轉譯服務上線(無 hotkey)。Ctrl+C / SIGTERM 退出");
+    tokio::signal::ctrl_c().await.ok();
+    info!("收到 Ctrl+C,serve-only 退出");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -540,6 +626,34 @@ async fn run() -> Result<ExitCode> {
     let paste_back_arc = Arc::new(cfg.paste_back);
     let backend_arc = Arc::new(cfg.backend.clone());
     let trim_cfg = cfg.voice_input.to_trim(); // Copy,每輪傳值即可
+    let transcribe_timeout = Duration::from_secs(cfg.transcribe_timeout_secs);
+
+    // 對外轉譯服務 —— 讓 AgentOS(http-service skill)/ mori-desktop 當 client 消費 ear 的轉錄。
+    // `_service` 綁進 daemon 生命週期(drop = unblock server + 刪 mori-ear-server.json descriptor)。
+    // 服務跑在自己一條 std thread,每 request 用這個 runtime 的 Handle block_on 跑 async 轉譯。
+    let _service = if cfg.service.enabled {
+        match service::serve(
+            tokio::runtime::Handle::current(),
+            service::ServiceParams {
+                backend: cfg.backend.clone(),
+                api_key: (*api_key_arc).clone(),
+                language: cfg.language.clone(),
+                cleanup_prompt_file: cfg.cleanup_prompt_file.clone(),
+                skip_cleanup_default: cfg.raw,
+                timeout: transcribe_timeout,
+            },
+            cfg.service.port,
+        ) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!(error = ?e, "轉譯服務啟動失敗(hotkey 仍照常;只是 AgentOS/desktop 暫時無法當 client)");
+                None
+            }
+        }
+    } else {
+        info!("service.enabled=false,跳過對外轉譯服務(只跑 hotkey daemon)");
+        None
+    };
 
     loop {
         tokio::select! {
@@ -560,6 +674,7 @@ async fn run() -> Result<ExitCode> {
                         paste_back_arc.clone(),
                         backend_arc.clone(),
                         trim_cfg,
+                        transcribe_timeout,
                     ).await;
                 }
             }
@@ -904,6 +1019,7 @@ async fn handle_event(
     paste_back_enabled: Arc<bool>,
     backend: Arc<String>,
     trim: audio::TrimConfig,
+    timeout: Duration,
 ) {
     match ev.state {
         HotKeyState::Pressed => {
@@ -948,37 +1064,45 @@ async fn handle_event(
             info!(bytes = wav.len(), duration_secs, rms_db, "錄音停止,送 STT");
             // STT 在 spawn 跑,主 loop 不卡
             tokio::spawn(async move {
-                let raw = match transcribe_with_fallback(&backend, api_key.as_deref(), &language, wav).await {
+                // STT(+cleanup)整段包進看門狗:逾時(transcribe_timeout_secs,預設 90s)就
+                // 放棄這句、不讓一輪卡住的轉譯把 daemon 拖住。
+                let text = match watchdog::guard(timeout, "hotkey:STT", async move {
+                    let raw =
+                        transcribe_with_fallback(&backend, api_key.as_deref(), &language, wav).await?;
+
+                    // Step 2:LLM cleanup(繁中校正 + 標點 + 簡轉繁)。需 Groq key;
+                    // skip_cleanup 或無 key(離線)→ 直接用 raw。cleanup 失敗也 fallback raw。
+                    let text = if *skip_cleanup {
+                        raw
+                    } else if let Some(key) = api_key.as_deref() {
+                        let prompt = cleanup::resolve_system_prompt(&cleanup_prompt_file);
+                        match cleanup::cleanup(key, &raw, &prompt).await {
+                            Ok(cleaned) => {
+                                info!(
+                                    raw_chars = raw.chars().count(),
+                                    clean_chars = cleaned.chars().count(),
+                                    "✓ cleanup OK"
+                                );
+                                cleaned
+                            }
+                            Err(e) => {
+                                warn!(error = ?e, "cleanup 失敗,用 raw whisper output");
+                                raw
+                            }
+                        }
+                    } else {
+                        info!("無 Groq key,跳過 cleanup,用 raw whisper output");
+                        raw
+                    };
+                    Ok::<String, anyhow::Error>(text)
+                })
+                .await
+                {
                     Ok(t) => t,
                     Err(e) => {
-                        error!(error = ?e, "STT 失敗(Groq + 本地 whisper-server 都不行)");
+                        error!(error = ?e, "轉譯失敗或逾時,放棄這句(STT/cleanup 不行或超時)");
                         return;
                     }
-                };
-
-                // Step 2:LLM cleanup(繁中校正 + 標點 + 簡轉繁)。需 Groq key;
-                // skip_cleanup 或無 key(離線)→ 直接用 raw。cleanup 失敗也 fallback raw。
-                let text = if *skip_cleanup {
-                    raw
-                } else if let Some(key) = api_key.as_deref() {
-                    let prompt = cleanup::resolve_system_prompt(&cleanup_prompt_file);
-                    match cleanup::cleanup(key, &raw, &prompt).await {
-                        Ok(cleaned) => {
-                            info!(
-                                raw_chars = raw.chars().count(),
-                                clean_chars = cleaned.chars().count(),
-                                "✓ cleanup OK"
-                            );
-                            cleaned
-                        }
-                        Err(e) => {
-                            warn!(error = ?e, "cleanup 失敗,用 raw whisper output");
-                            raw
-                        }
-                    }
-                } else {
-                    info!("無 Groq key,跳過 cleanup,用 raw whisper output");
-                    raw
                 };
 
                 // (a) stdout 永遠印 — pipe 用法 / `mori-ear > log.txt` 都靠這

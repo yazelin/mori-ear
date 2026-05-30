@@ -6,16 +6,27 @@ For Claude / agents working in this repo. README.md is the human-facing entry po
 
 A minimal Rust CLI: global hotkey → microphone capture → STT → Groq LLM cleanup → clipboard + Ctrl+V paste-back into the focused window. No GUI, no tray, no persistent state. The "ear" organ in the Mori universe — runs as an independent process so mori-desktop restarts don't kill voice input.
 
-STT has two backends (config `backend`, default `auto`): **Groq Whisper API** (cloud, fast) and a **local whisper-server** (the shared `~/.mori/whisper-server.json` discovery contract — see `src/local_stt.rs`). `auto` prefers Groq, falls back to local on Groq failure or when there's no Groq key; `groq` / `local` force one. mori-ear is a read-only **Adopter** of the local server (never starts/writes it — that's the Starter's job, today mori-meeting-recorder). Cleanup stays Groq; offline (no key) → STT goes local + cleanup is skipped (raw output).
+STT has two backends (config `backend`, default `auto`): **Groq Whisper API** (cloud, fast) and a **local whisper-server** (the shared `~/.mori/whisper-server.json` discovery contract — see `src/local_stt.rs`). `auto` prefers local whisper-server first (data stays on-device), falls back to Groq on local failure (when a key exists); `groq` / `local` force one. mori-ear is a read-only **Adopter** of the local server (never starts/writes it — that's the Starter's job, today mori-meeting-recorder). Cleanup stays Groq; offline (no key) → STT goes local + cleanup is skipped (raw output).
+
+Beyond the hotkey daemon, mori-ear also exposes an **outbound transcription service** so it can be the Mori universe's single STT provider: `GET /` (ready gate) + `POST /inference` (multipart `file`=WAV → `{"text":...}`), bound to `127.0.0.1:<ephemeral>` and advertised via its own descriptor `~/.mori/mori-ear-server.json` (see `src/service.rs`). AgentOS / mori-desktop consume this as clients. This is **not** a GUI/tray (those stay forbidden) — it's a headless, governable HTTP endpoint, declared in `manifest.json` (Body Interface `BodyManifest`, `kind: local_service`).
+
+**Two descriptors, two roles — never conflate:** ear *reads* the shared `~/.mori/whisper-server.json` as an **Adopter** (someone else's raw whisper-server), and *writes* its own `~/.mori/mori-ear-server.json` as the **provider** of its smart `/inference` service. mori-ear must never write/lock `whisper-server.json`.
+
+Every transcription (hotkey, batch, and service paths) runs under a **watchdog** (`src/watchdog.rs`): `transcribe_timeout_secs` (default 90) caps one STT+cleanup; on timeout the future is dropped (reqwest connection closes) so a stuck transcription can never wedge the daemon. `ChildGuard` is in place to `kill()` any spawned ffmpeg/whisper-cli child the moment a future is cancelled — currently dormant (STT is pure HTTP, no child) but wired for the Phase-2 local path.
 
 ## Layout
 
 ```
+manifest.json    — Body Interface manifest (BodyManifest schema, kind=local_service)
 src/
-  main.rs        — entry, config, hotkey thread, paste-back
+  main.rs        — entry, config, hotkey thread, paste-back, service wiring, watchdog wrap
   audio.rs       — cpal capture + WAV encode
   stt.rs         — Groq Whisper multipart POST
   cleanup.rs     — Groq LLM繁中 cleanup
+  local_stt.rs   — local whisper-server fallback client (Adopter of ~/.mori/whisper-server.json)
+  service.rs     — outbound HTTP transcription service (GET / · POST /inference) + descriptor writer
+  watchdog.rs    — per-transcription timeout guard (+ ChildGuard for future local children)
+  multipart.rs   — minimal multipart/form-data parser for POST /inference
 scripts/
   install-autostart.ps1  — Windows scheduled task (self-elevating)
   remove-autostart.ps1   — delegates to install -Remove
@@ -80,6 +91,25 @@ Old behavior was "ear.json wins entirely or nothing" — a user writing a one-li
 ### STT backend selection (`backend`)
 
 `ear.json` `backend` ∈ `auto` (default) | `groq` | `local`. Since `auto`/`local` can run without a Groq key, startup no longer hard-requires the key — it only bails when `backend = "groq"` and no key is resolvable. The local path reads `~/.mori/whisper-server.json`, verifies alive (loopback + `GET /` 200), **resamples to 16kHz mono** (whisper.cpp needs it; Groq resamples server-side so its path is untouched), then POSTs `/inference`. Security in `local_stt.rs` mirrors AgentOS whisper_client: loopback host pin, `redirect(none)`, `no_proxy()`, 512MB WAV cap.
+
+### Transcription watchdog (`transcribe_timeout_secs`)
+
+`ear.json` `transcribe_timeout_secs` (default `90`) is the **overall** cap on one STT(+cleanup), shared by the hotkey, batch, and service paths (`watchdog::guard`). It exists because the per-request reqwest timeouts (Groq 60s / local 120s / cleanup 30s) can stack to ~210s in the `auto` fallback chain — the watchdog gives one configurable ceiling. On timeout the future is dropped (connection closes) and that utterance is abandoned with a logged error; the daemon keeps running. Tune up if you batch genuinely long files.
+
+### Outbound transcription service (`service.*`)
+
+`ear.json` `service` controls the HTTP `/inference` provider:
+
+```jsonc
+{
+  "service": {
+    "enabled": true,   // false → only the hotkey daemon, no outbound endpoint
+    "port": 0          // 0 = OS-assigned ephemeral; written into the descriptor
+  }
+}
+```
+
+When enabled, `run()` binds `127.0.0.1:<port>`, atomically writes `~/.mori/mori-ear-server.json`, and serves on a dedicated std thread (each request uses the tokio `Handle` to `block_on` the async transcribe — legal because that thread isn't a runtime worker). `POST /inference` accepts multipart `file` (WAV) plus optional `language` / `backend` (`auto`/`groq`/`local`, per-request override — this is how a caller forces on-device transcription) / `cleanup` (`false`/`0`/`raw`/`none` → skip the繁中 cleanup). On shutdown the `ServiceHandle` drop unblocks the server and removes the descriptor. Startup failure is non-fatal: it warns and the hotkey daemon keeps working.
 
 ## Audio guardrails (why STT might be skipped)
 

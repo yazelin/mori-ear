@@ -24,6 +24,10 @@ struct Descriptor {
     port: u16,
     #[serde(default = "default_inference_path")]
     inference_path: String,
+    /// server 載入的模型短名(契約有給,例如 "large-v3-turbo")。純資訊用 —— 讓 mori-ear
+    /// 能 log「這次走的是哪個本機模型」,解掉「不知道現在用誰」的盲區。
+    #[serde(default)]
+    model: Option<String>,
 }
 
 fn default_inference_path() -> String {
@@ -169,9 +173,10 @@ async fn transcribe_local(d: &Descriptor, language: &str, wav16: Vec<u8>) -> Res
             .file_name("audio.wav")
             .mime_str("audio/wav")?,
     );
-    if !language.is_empty() {
-        form = form.text("language", language.to_string());
-    }
+    // whisper.cpp server 沒給 language 時**預設 "en"** → 對中文語音會整段轉成英文亂碼。
+    // 空 language 時送 "auto" 讓它自動偵測(對齊 Groq 雲端的行為)。
+    let lang = if language.is_empty() { "auto" } else { language };
+    form = form.text("language", lang.to_string());
     let resp = client
         .post(d.inference_url())
         .multipart(form)
@@ -198,6 +203,13 @@ pub async fn transcribe_default(language: &str, wav_bytes: Vec<u8>) -> Result<St
         );
     }
     let wav16 = resample_wav_to_16k(&wav_bytes).context("resample 到 16kHz")?;
+    tracing::info!(
+        backend = "local",
+        model = d.model.as_deref().unwrap_or("unknown"),
+        host = %d.host,
+        port = d.port,
+        "STT 走本地 whisper-server"
+    );
     transcribe_local(&d, language, wav16).await
 }
 
@@ -262,9 +274,9 @@ mod tests {
 
     #[test]
     fn inference_url_normalizes_and_pins_loopback() {
-        let d = Descriptor { host: "127.0.0.1".into(), port: 12345, inference_path: "inference".into() };
+        let d = Descriptor { host: "127.0.0.1".into(), port: 12345, inference_path: "inference".into(), model: None };
         assert_eq!(d.inference_url(), "http://127.0.0.1:12345/inference");
-        let evil = Descriptor { host: "127.0.0.1".into(), port: 12345, inference_path: "@evil.com/".into() };
+        let evil = Descriptor { host: "127.0.0.1".into(), port: 12345, inference_path: "@evil.com/".into(), model: None };
         assert!(
             evil.inference_url().starts_with("http://127.0.0.1:12345/"),
             "userinfo 注入應被前導 / 擋住: {}",
@@ -274,7 +286,7 @@ mod tests {
 
     #[test]
     fn non_loopback_host_is_rejected() {
-        let d = Descriptor { host: "10.0.0.5".into(), port: 9, inference_path: "/inference".into() };
+        let d = Descriptor { host: "10.0.0.5".into(), port: 9, inference_path: "/inference".into(), model: None };
         assert!(!d.is_loopback(), "非 loopback host 應被拒(會議音訊不外送)");
     }
 
@@ -302,7 +314,7 @@ mod tests {
             }
         });
 
-        let d = Descriptor { host: "127.0.0.1".into(), port, inference_path: "/inference".into() };
+        let d = Descriptor { host: "127.0.0.1".into(), port, inference_path: "/inference".into(), model: None };
         assert!(verify_alive(&d).await, "活著的 stub 應驗活通過");
         let text = transcribe_local(&d, "zh", wav_at(16_000, 1600)).await.unwrap();
         assert_eq!(text, "哈囉世界");

@@ -191,17 +191,21 @@ async fn transcribe_local(d: &Descriptor, language: &str, wav16: Vec<u8>) -> Res
     Ok(parsed.text.trim().to_string())
 }
 
-/// 高階入口:讀預設 descriptor → 驗活 → resample 16k → forward。任一步失敗回 Err
-/// (caller 在 auto 模式下會在 Groq 失敗後呼叫它;它再失敗 = 整體失敗)。
+/// 高階入口:讀預設 descriptor → 驗活(沒在線就 §11 喚醒共享 server)→ resample 16k → forward。
+/// 任一步失敗回 Err(caller:auto 模式本機優先,它失敗才 fallback Groq;local 模式它失敗 = 整體失敗)。
 pub async fn transcribe_default(language: &str, wav_bytes: Vec<u8>) -> Result<String> {
     let path = default_descriptor_path();
-    let d = read_descriptor(&path)?;
-    if !verify_alive(&d).await {
-        anyhow::bail!(
-            "本地 whisper-server 未在線(descriptor {} / 非 loopback 或 GET / 不通)",
-            path.display()
-        );
-    }
+    // 已在線就用;沒在線(缺檔 / 壞檔 / 驗活不過)→ §11 喚醒共享 server、poll ready 後再用。
+    let d = match read_descriptor(&path) {
+        Ok(d) if verify_alive(&d).await => d,
+        _ => match wake_and_wait().await {
+            Some(d) => d,
+            None => anyhow::bail!(
+                "本地 whisper-server 未在線且喚醒失敗(descriptor {} / 非 loopback 或 GET / 不通 / 沒裝 supervisor)",
+                path.display()
+            ),
+        },
+    };
     let wav16 = resample_wav_to_16k(&wav_bytes).context("resample 到 16kHz")?;
     tracing::info!(
         backend = "local",
@@ -211,6 +215,83 @@ pub async fn transcribe_default(language: &str, wav_bytes: Vec<u8>) -> Result<St
         "STT 走本地 whisper-server"
     );
     transcribe_local(&d, language, wav16).await
+}
+
+// ─── §11 Activation:隨需喚醒共享 whisper-server ──────────────────────────────
+//
+// mori-ear 仍是 **Adopter**:它**不**自己 spawn whisper-server、**不**寫/鎖 descriptor。
+// 這裡只「踢一下」冪等的 supervisor —— `~/.mori/bin/mori-whisper-serve --ensure`(它才是
+// Starter/Owner:搶 flock、起 server、寫 descriptor)。喚醒後 poll descriptor 直到 ready。
+// 失敗 / 沒裝 supervisor → 安靜回 None(caller 照舊 bail / fallback Groq,standalone-first 不破)。
+// 契約 §11:agentos-notebook/05-mori-migration/whisper-server-contract.md。
+
+/// 喚醒後等 ready 的上限(秒)。預設模型 small 冷啟動 ~6s;mori-ear 的 watchdog
+/// (transcribe_timeout_secs 預設 90)是整體上限,這裡不宜久等(auto 模式還要留時間 fallback Groq)。
+const WAKE_READY_TIMEOUT_SECS: u64 = 15;
+const WAKE_POLL_INTERVAL_MS: u64 = 500;
+
+/// supervisor 執行檔:先 §11 共用安裝點 `~/.mori/bin/mori-whisper-serve`,找不到退回裸名走 PATH。
+fn supervisor_program() -> std::path::PathBuf {
+    let name = if cfg!(windows) {
+        "mori-whisper-serve.exe"
+    } else {
+        "mori-whisper-serve"
+    };
+    let shared = crate::home_dir().join(".mori").join("bin").join(name);
+    if shared.exists() {
+        shared
+    } else {
+        std::path::PathBuf::from(name) // PATH fallback
+    }
+}
+
+/// 跑 `mori-whisper-serve --ensure`(冪等、自我背景化、馬上返回)。等它退出(很快)以免留殭屍;
+/// 它已把長命的 supervise 子程序 detached 出去(setsid、reparent 給 init,比 mori-ear 長壽)。
+/// Linux 關繼承 fd(別讓這個短命 shim 帶走 mori-ear 的 single-instance socket;見 pre_exec_close_fds)。
+async fn request_wake() -> Result<()> {
+    let program = supervisor_program();
+    let status = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&program);
+        cmd.arg("--ensure")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(target_os = "linux")]
+        crate::pre_exec_close_fds(&mut cmd);
+        cmd.status()
+    })
+    .await
+    .context("join wake spawn task")?
+    .context("spawn `mori-whisper-serve --ensure`(沒裝 supervisor?)")?;
+    if !status.success() {
+        anyhow::bail!("`mori-whisper-serve --ensure` 退出碼 {status}");
+    }
+    Ok(())
+}
+
+/// 喚醒共享 server + poll 直到 ready(或 timeout)。回 Some(Descriptor) 代表現在活著可用。
+async fn wake_and_wait() -> Option<Descriptor> {
+    if let Err(e) = request_wake().await {
+        tracing::info!(error = %e, "喚醒共享 whisper-server 失敗 → 略過 wake(caller fallback)");
+        return None;
+    }
+    tracing::info!("已請求喚醒共享 whisper-server(--ensure),等它 ready…");
+    let path = default_descriptor_path();
+    let deadline = std::time::Instant::now() + Duration::from_secs(WAKE_READY_TIMEOUT_SECS);
+    loop {
+        if let Ok(d) = read_descriptor(&path) {
+            if verify_alive(&d).await {
+                return Some(d);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "喚醒後 {WAKE_READY_TIMEOUT_SECS}s 內 whisper-server 仍未 ready → 放棄本地(caller fallback)"
+            );
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(WAKE_POLL_INTERVAL_MS)).await;
+    }
 }
 
 #[cfg(test)]
@@ -288,6 +369,17 @@ mod tests {
     fn non_loopback_host_is_rejected() {
         let d = Descriptor { host: "10.0.0.5".into(), port: 9, inference_path: "/inference".into(), model: None };
         assert!(!d.is_loopback(), "非 loopback host 應被拒(會議音訊不外送)");
+    }
+
+    #[test]
+    fn supervisor_program_resolves_to_right_binary_name() {
+        // 不管走共用安裝點還是 PATH fallback,檔名都該是平台對應的 supervisor。
+        let p = supervisor_program();
+        let name = p.file_name().unwrap().to_string_lossy();
+        #[cfg(windows)]
+        assert_eq!(name, "mori-whisper-serve.exe");
+        #[cfg(not(windows))]
+        assert_eq!(name, "mori-whisper-serve");
     }
 
     #[tokio::test]

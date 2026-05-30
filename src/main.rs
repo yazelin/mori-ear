@@ -720,7 +720,7 @@ fn paste_back(text: &str) -> anyhow::Result<()> {
 ///
 /// SAFETY: pre_exec 內只能用 async-signal-safe 函式。close(2) 跟 getrlimit(2) 都 AS-safe。
 #[cfg(target_os = "linux")]
-fn pre_exec_close_fds(cmd: &mut std::process::Command) -> &mut std::process::Command {
+pub(crate) fn pre_exec_close_fds(cmd: &mut std::process::Command) -> &mut std::process::Command {
     use std::os::unix::process::CommandExt;
     unsafe {
         cmd.pre_exec(|| {

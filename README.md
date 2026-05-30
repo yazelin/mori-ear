@@ -235,6 +235,7 @@ gsettings reset org.gnome.settings-daemon.plugins.media-keys custom-keybindings 
 {
   "hotkey": "Ctrl+Alt+E",
   "groq_api_key": "gsk_...",
+  "backend": "auto",
   "language": "zh",
   "raw": false,
   "cleanup_prompt_file": "~/.mori/voice_input/USER-00.純文字輸入.md",
@@ -249,6 +250,7 @@ gsettings reset org.gnome.settings-daemon.plugins.media-keys custom-keybindings 
 
 - `hotkey`:`Ctrl+Alt+E` / `Ctrl+Shift+V` / `Ctrl+Alt+Y` 等。被別的程式佔走會 register 失敗 — 換一組。
 - `groq_api_key`:留空時 fallback 去 `~/.mori/config.json` 的 `providers.groq.api_key`(跟 mori-desktop 共用),再 fallback 環境變數 `GROQ_API_KEY`。
+- `backend`:STT 後端 `auto`(預設)/ `groq`(只雲端)/ `local`(只本機、音檔不離機)。`auto` 本機優先、本機不行才 Groq。**本機隨需自啟**:`local`/`auto` 要用本機 whisper-server 但它沒在跑時,mori-ear 會用 `~/.mori/bin/mori-whisper-serve --ensure` 把它叫醒(冪等)、等它 ready(≤15s)再用;裝了那支 supervisor 才有,沒有就 fallback Groq(`auto`)或報錯(`local`)。沒人用滿 10 分鐘 server 自己關。
 - `language`:空 = 自動偵測。`zh` / `en` / 其他 ISO 639-1。
 - `raw`:`true` = 跳過 cleanup LLM,直接送 raw Whisper 輸出(省 ~200ms 跟一輪 token,但會有錯字 / 簡體)。
 - `cleanup_prompt_file`:cleanup LLM 的 system prompt 來源 `.md` / `.txt` 路徑(支援 `~/`)。空 / 檔不存在 → fallback 內建 prompt。**每次 cleanup live-read**,改 prompt 不必重啟 mori-ear。指向 `~/.mori/voice_input/USER-00.純文字輸入.md` 可跟 mori-desktop 共用同一份。

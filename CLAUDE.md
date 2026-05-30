@@ -8,7 +8,12 @@ A minimal Rust CLI: global hotkey → microphone capture → STT → Groq LLM cl
 
 STT has two backends (config `backend`, default `auto`): **Groq Whisper API** (cloud, fast) and a **local whisper-server** (the shared `~/.mori/whisper-server.json` discovery contract — see `src/local_stt.rs`). `auto` prefers local whisper-server first (data stays on-device), falls back to Groq on local failure (when a key exists); `groq` / `local` force one. mori-ear is a read-only **Adopter** of the local server (never starts/writes it — that's the Starter's job, today mori-meeting-recorder). Cleanup stays Groq; offline (no key) → STT goes local + cleanup is skipped (raw output).
 
-Beyond the hotkey daemon, mori-ear also exposes an **outbound transcription service** so it can be the Mori universe's single STT provider: `GET /` (ready gate) + `POST /inference` (multipart `file`=WAV → `{"text":...}`), bound to `127.0.0.1:<ephemeral>` and advertised via its own descriptor `~/.mori/mori-ear-server.json` (see `src/service.rs`). AgentOS / mori-desktop consume this as clients. This is **not** a GUI/tray (those stay forbidden) — it's a headless, governable HTTP endpoint, declared in `manifest.json` (Body Interface `BodyManifest`, `kind: local_service`).
+Beyond the hotkey daemon, mori-ear also exposes an **outbound transcription service** so it can be the Mori universe's single STT provider: `GET /` (ready gate) + `POST /inference` (multipart `file`=WAV → `{"text":...}`), bound to `127.0.0.1:<ephemeral>` and advertised via its own descriptor `~/.mori/mori-ear-server.json` (see `src/service.rs`). AgentOS / mori-desktop consume this as clients. This is **not** a GUI/tray (those stay forbidden) — it's a headless, governable HTTP endpoint.
+
+**Two governance manifests — different systems, don't conflate:**
+
+- `agentos-manifest.json` — **AgentOS** `AppManifest` v2 (`agentos-core/src/manifest.rs`). `kind: body-part`, `provides: [{ skill: "ear.transcribe", kind: "http-service", http_service: { descriptor_path: "~/.mori/mori-ear-server.json" } }]`. This is what makes mori-ear installable into **AgentOS** and governed by its broker: AgentOS's `whisper_client` reads the descriptor → verifies alive → forwards `/inference`. (`SkillKind::HttpService` and `whisper_client` are **implemented** in agentos-core — verified; don't let stale notes call them "phantom".)
+- `manifest.json` — **mori-desktop** `BodyManifest` (BI-1 body registry, `body/manifest.rs`, `schema_version: 1`, `kind: local_service`). A *separate* registry that lets the **body (mori-desktop)** discover the organ. Different schema, different consumer.
 
 **Two descriptors, two roles — never conflate:** ear *reads* the shared `~/.mori/whisper-server.json` as an **Adopter** (someone else's raw whisper-server), and *writes* its own `~/.mori/mori-ear-server.json` as the **provider** of its smart `/inference` service. mori-ear must never write/lock `whisper-server.json`.
 
@@ -17,7 +22,8 @@ Every transcription (hotkey, batch, and service paths) runs under a **watchdog**
 ## Layout
 
 ```
-manifest.json    — Body Interface manifest (BodyManifest schema, kind=local_service)
+manifest.json         — mori-desktop Body Interface manifest (BodyManifest / BI-1, schema_version 1, kind=local_service)
+agentos-manifest.json — AgentOS AppManifest v2 (kind=body-part, provides ear.transcribe as http-service)
 src/
   main.rs        — entry, config, hotkey thread, paste-back, service wiring, watchdog wrap
   audio.rs       — cpal capture + WAV encode

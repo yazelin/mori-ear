@@ -16,6 +16,10 @@ reqwest = { version = "0.12", features = ["multipart", "rustls-tls", "json"], de
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 # global hotkey(MVP:Linux X11 + Windows;Wayland 之後加 ashpd)
 global-hotkey = "0.6"
+# 對外轉譯服務的 HTTP server(GET / 驗活、POST /inference)。blocking、極小依賴,
+# 符合 ear 的極簡調性(不引 axum/hyper)。每 request 在 service thread 用 tokio Handle
+# block_on 跑 async 轉譯。
+tiny_http = "0.12"
 # paste-back:type 進焦點視窗。enigo 跨 Linux X11 / Windows / macOS,Unicode OK
 enigo = "0.5"
 # 單一實例 lock(Linux 用 abstract socket、Windows 用 named mutex、macOS lock file)
@@ -62,9 +66,8 @@ windows = { version = "0.58", features = [
     "Win32_System_Console",
 ] }
 
-[dev-dependencies]
-# 本地 whisper-server fallback 的 stub server(測試用,對齊 AgentOS 的證法)
-tiny_http = "0.12"
+# tiny_http 同時供測試用(本地 whisper-server fallback 的 stub server,對齊 AgentOS 證法);
+# 已在 [dependencies] 宣告,測試自然取用,毋須在 dev-dependencies 重複。
 
 [profile.release]
 opt-level = "z"

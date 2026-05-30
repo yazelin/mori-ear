@@ -1,0 +1,21 @@
+{
+  "schema_version": 2,
+  "id": "mori.ear",
+  "name": "Mori Ear",
+  "kind": "body-part",
+  "version": "0.1.0",
+  "realm_mode": "personal",
+  "capabilities": ["audio.capture"],
+  "permissions": [
+    { "class": "audio.capture" }
+  ],
+  "data_policy": { "owns_raw_data": false, "default_ingestion": "off" },
+  "provides": [
+    {
+      "skill": "ear.transcribe",
+      "kind": "http-service",
+      "exportable": true,
+      "http_service": { "descriptor_path": "~/.mori/mori-ear-server.json" }
+    }
+  ]
+}

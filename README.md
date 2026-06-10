@@ -239,6 +239,7 @@ gsettings reset org.gnome.settings-daemon.plugins.media-keys custom-keybindings 
   "language": "zh",
   "raw": false,
   "cleanup_prompt_file": "~/.mori/voice_input/USER-00.純文字輸入.md",
+  "stt_initial_prompt_file": "~/.mori/mori-ear/stt-initial-prompt.md",
   "paste_back": true,
   "voice_input": {
     "trim_silence_enabled": true,
@@ -254,6 +255,7 @@ gsettings reset org.gnome.settings-daemon.plugins.media-keys custom-keybindings 
 - `language`:空 = 自動偵測。`zh` / `en` / 其他 ISO 639-1。
 - `raw`:`true` = 跳過 cleanup LLM,直接送 raw Whisper 輸出(省 ~200ms 跟一輪 token,但會有錯字 / 簡體)。
 - `cleanup_prompt_file`:cleanup LLM 的 system prompt 來源 `.md` / `.txt` 路徑(支援 `~/`)。空 / 檔不存在 → fallback 內建 prompt。**每次 cleanup live-read**,改 prompt 不必重啟 mori-ear。指向 `~/.mori/voice_input/USER-00.純文字輸入.md` 可跟 mori-desktop 共用同一份。
+- `stt_initial_prompt_file`:Whisper/Groq STT initial prompt 來源 `.md` / `.txt` 路徑(支援 `~/`)。空時依序讀 `~/.mori/mori-ear/stt-initial-prompt.md`、`~/.mori/stt/initial-prompt.md`。這是**轉錄 decoder context**(專有名詞 / 繁中 / 台灣用語 bias),不是 cleanup LLM system prompt;每次轉錄前 live-read,改檔不用重啟 mori-ear。HTTP `/inference` 也可用 multipart 欄位 `prompt` 臨時覆寫。
 - `paste_back`:`true`(預設)= 同時印 stdout + 貼進焦點視窗;`false` = 只印 stdout,不碰 clipboard、不按 Ctrl+V。pipe 用法 / headless / 不想干擾焦點視窗時設 `false`。
 - `voice_input`:送 STT 前的靜音剪裁(對齊 mori-desktop 的 `config.json` `voice_input.*`)。`trim_silence_enabled`(預設 `true`)剪掉**首尾靜音 + 中間連續停頓 ≥ `trim_silence_min_ms`**(預設 300ms,短停頓留著給 Whisper 斷句)。`trim_silence_threshold`(預設 0.02,線性振幅 ≈ -34 dBFS)是「多大才算有聲」。設 `trim_silence_enabled: false` → 整段原樣送(舊行為)。**剪裁不影響** duration/RMS 跳過守門(那個用剪裁前整段算)。
 

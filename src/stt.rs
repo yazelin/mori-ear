@@ -12,21 +12,27 @@ struct Response {
     text: String,
 }
 
-pub async fn transcribe(api_key: &str, language: &str, wav_bytes: Vec<u8>) -> Result<String> {
+pub async fn transcribe(
+    api_key: &str,
+    language: &str,
+    initial_prompt: Option<&str>,
+    wav_bytes: Vec<u8>,
+) -> Result<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
 
-    let mut form = Form::new()
-        .text("model", MODEL)
-        .part(
-            "file",
-            Part::bytes(wav_bytes)
-                .file_name("audio.wav")
-                .mime_str("audio/wav")?,
-        );
+    let mut form = Form::new().text("model", MODEL).part(
+        "file",
+        Part::bytes(wav_bytes)
+            .file_name("audio.wav")
+            .mime_str("audio/wav")?,
+    );
     if !language.is_empty() {
         form = form.text("language", language.to_string());
+    }
+    if let Some(prompt) = initial_prompt.map(str::trim).filter(|p| !p.is_empty()) {
+        form = form.text("prompt", prompt.to_string());
     }
 
     let resp = client

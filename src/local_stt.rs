@@ -98,8 +98,8 @@ fn resample_wav_to_16k(wav: &[u8]) -> Result<Vec<u8>> {
     if wav.len() > MAX_WAV_BYTES {
         anyhow::bail!("WAV 過大: {} bytes(上限 {MAX_WAV_BYTES})", wav.len());
     }
-    let mut reader =
-        hound::WavReader::new(std::io::Cursor::new(wav)).context("decode WAV(本地路徑需可解碼 WAV)")?;
+    let mut reader = hound::WavReader::new(std::io::Cursor::new(wav))
+        .context("decode WAV(本地路徑需可解碼 WAV)")?;
     let spec = reader.spec();
     let samples: Vec<i16> = match spec.sample_format {
         hound::SampleFormat::Int => reader
@@ -165,7 +165,12 @@ fn resample_linear(input: &[i16], src: u32, dst: u32) -> Vec<i16> {
     out
 }
 
-async fn transcribe_local(d: &Descriptor, language: &str, wav16: Vec<u8>) -> Result<String> {
+async fn transcribe_local(
+    d: &Descriptor,
+    language: &str,
+    initial_prompt: Option<&str>,
+    wav16: Vec<u8>,
+) -> Result<String> {
     let client = http_client(Duration::from_secs(120))?;
     let mut form = Form::new().part(
         "file",
@@ -175,8 +180,15 @@ async fn transcribe_local(d: &Descriptor, language: &str, wav16: Vec<u8>) -> Res
     );
     // whisper.cpp server 沒給 language 時**預設 "en"** → 對中文語音會整段轉成英文亂碼。
     // 空 language 時送 "auto" 讓它自動偵測(對齊 Groq 雲端的行為)。
-    let lang = if language.is_empty() { "auto" } else { language };
+    let lang = if language.is_empty() {
+        "auto"
+    } else {
+        language
+    };
     form = form.text("language", lang.to_string());
+    if let Some(prompt) = initial_prompt.map(str::trim).filter(|p| !p.is_empty()) {
+        form = form.text("prompt", prompt.to_string());
+    }
     let resp = client
         .post(d.inference_url())
         .multipart(form)
@@ -187,13 +199,20 @@ async fn transcribe_local(d: &Descriptor, language: &str, wav16: Vec<u8>) -> Res
     if !status.is_success() {
         anyhow::bail!("local whisper-server HTTP {status}");
     }
-    let parsed: InferenceResponse = resp.json().await.context("parse local whisper-server response")?;
+    let parsed: InferenceResponse = resp
+        .json()
+        .await
+        .context("parse local whisper-server response")?;
     Ok(parsed.text.trim().to_string())
 }
 
 /// 高階入口:讀預設 descriptor → 驗活(沒在線就 §11 喚醒共享 server)→ resample 16k → forward。
 /// 任一步失敗回 Err(caller:auto 模式本機優先,它失敗才 fallback Groq;local 模式它失敗 = 整體失敗)。
-pub async fn transcribe_default(language: &str, wav_bytes: Vec<u8>) -> Result<String> {
+pub async fn transcribe_default(
+    language: &str,
+    initial_prompt: Option<&str>,
+    wav_bytes: Vec<u8>,
+) -> Result<String> {
     let path = default_descriptor_path();
     // 已在線就用;沒在線(缺檔 / 壞檔 / 驗活不過)→ §11 喚醒共享 server、poll ready 後再用。
     let d = match read_descriptor(&path) {
@@ -214,7 +233,7 @@ pub async fn transcribe_default(language: &str, wav_bytes: Vec<u8>) -> Result<St
         port = d.port,
         "STT 走本地 whisper-server"
     );
-    transcribe_local(&d, language, wav16).await
+    transcribe_local(&d, language, initial_prompt, wav16).await
 }
 
 // ─── §11 Activation:隨需喚醒共享 whisper-server ──────────────────────────────
@@ -324,7 +343,10 @@ mod tests {
         assert_eq!(spec.channels, 1);
         assert_eq!(spec.bits_per_sample, 16);
         let n = r.into_samples::<i16>().count();
-        assert!((n as i32 - 1600).abs() < 20, "16k 0.1s 應 ~1600 樣本,得 {n}");
+        assert!(
+            (n as i32 - 1600).abs() < 20,
+            "16k 0.1s 應 ~1600 樣本,得 {n}"
+        );
     }
 
     #[test]
@@ -332,7 +354,11 @@ mod tests {
         let out = resample_wav_to_16k(&wav_at(16_000, 1600)).unwrap();
         let r = hound::WavReader::new(std::io::Cursor::new(out)).unwrap();
         assert_eq!(r.spec().sample_rate, 16_000);
-        assert_eq!(r.into_samples::<i16>().count(), 1600, "16k passthrough 樣本數不變");
+        assert_eq!(
+            r.into_samples::<i16>().count(),
+            1600,
+            "16k passthrough 樣本數不變"
+        );
     }
 
     #[test]
@@ -355,9 +381,19 @@ mod tests {
 
     #[test]
     fn inference_url_normalizes_and_pins_loopback() {
-        let d = Descriptor { host: "127.0.0.1".into(), port: 12345, inference_path: "inference".into(), model: None };
+        let d = Descriptor {
+            host: "127.0.0.1".into(),
+            port: 12345,
+            inference_path: "inference".into(),
+            model: None,
+        };
         assert_eq!(d.inference_url(), "http://127.0.0.1:12345/inference");
-        let evil = Descriptor { host: "127.0.0.1".into(), port: 12345, inference_path: "@evil.com/".into(), model: None };
+        let evil = Descriptor {
+            host: "127.0.0.1".into(),
+            port: 12345,
+            inference_path: "@evil.com/".into(),
+            model: None,
+        };
         assert!(
             evil.inference_url().starts_with("http://127.0.0.1:12345/"),
             "userinfo 注入應被前導 / 擋住: {}",
@@ -367,7 +403,12 @@ mod tests {
 
     #[test]
     fn non_loopback_host_is_rejected() {
-        let d = Descriptor { host: "10.0.0.5".into(), port: 9, inference_path: "/inference".into(), model: None };
+        let d = Descriptor {
+            host: "10.0.0.5".into(),
+            port: 9,
+            inference_path: "/inference".into(),
+            model: None,
+        };
         assert!(!d.is_loopback(), "非 loopback host 應被拒(會議音訊不外送)");
     }
 
@@ -395,20 +436,29 @@ mod tests {
                     let _ = req.as_reader().read_to_end(&mut body);
                 }
                 // 驗 multipart 真的帶 file part(否則 malformed form 也假綠)。
-                let payload = if is_inf && String::from_utf8_lossy(&body).contains("name=\"file\"") {
+                let payload = if is_inf && String::from_utf8_lossy(&body).contains("name=\"file\"")
+                {
                     r#"{"text":"哈囉世界"}"#
                 } else if is_inf {
                     r#"{"error":"missing file"}"#
                 } else {
                     "ok"
                 };
-                let _ = req.respond(tiny_http::Response::from_string(payload).with_status_code(200));
+                let _ =
+                    req.respond(tiny_http::Response::from_string(payload).with_status_code(200));
             }
         });
 
-        let d = Descriptor { host: "127.0.0.1".into(), port, inference_path: "/inference".into(), model: None };
+        let d = Descriptor {
+            host: "127.0.0.1".into(),
+            port,
+            inference_path: "/inference".into(),
+            model: None,
+        };
         assert!(verify_alive(&d).await, "活著的 stub 應驗活通過");
-        let text = transcribe_local(&d, "zh", wav_at(16_000, 1600)).await.unwrap();
+        let text = transcribe_local(&d, "zh", None, wav_at(16_000, 1600))
+            .await
+            .unwrap();
         assert_eq!(text, "哈囉世界");
 
         server.unblock();

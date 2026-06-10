@@ -4,7 +4,7 @@
 //! 端點(對齊 whisper-server-contract.md 的 baseline 形狀):
 //!   GET  /            → 200「mori-ear ok」 (契約 §3.1 的 authoritative ready gate,client 驗活用)
 //!   GET  /health      → 200(同上,別名)
-//!   POST /inference   → multipart/form-data:`file`=WAV(必),`language`/`backend`/`cleanup`(選)
+//!   POST /inference   → multipart/form-data:`file`=WAV(必),`language`/`backend`/`cleanup`/`prompt`(選)
 //!                       → STT(+繁中 cleanup)經看門狗 → 200 {"text":"..."};失敗 = 非 2xx + 文字 body
 //!
 //! 跟 ear 既有「Adopter of `~/.mori/whisper-server.json`(共享 raw whisper-server)」是兩回事:
@@ -31,6 +31,7 @@ pub struct ServiceParams {
     pub api_key: Option<String>,
     pub language: String,
     pub cleanup_prompt_file: String,
+    pub stt_initial_prompt_file: String,
     /// 預設是否跳過 cleanup(= `Config::raw`);per-request `cleanup` 欄位可覆寫。
     pub skip_cleanup_default: bool,
     /// 一次轉譯(STT+cleanup)的整體上限。
@@ -56,7 +57,11 @@ impl Drop for ServiceHandle {
 }
 
 /// 啟動服務:bind 127.0.0.1:<port>(0 = ephemeral)→ 原子寫 descriptor → spawn accept thread。
-pub fn serve(handle: tokio::runtime::Handle, params: ServiceParams, port: u16) -> Result<ServiceHandle> {
+pub fn serve(
+    handle: tokio::runtime::Handle,
+    params: ServiceParams,
+    port: u16,
+) -> Result<ServiceHandle> {
     let addr = format!("127.0.0.1:{port}");
     let server = Server::http(&addr).map_err(|e| anyhow::anyhow!("bind {addr} 失敗: {e}"))?;
     let server = Arc::new(server);
@@ -139,6 +144,7 @@ fn respond_inference(mut req: Request, handle: &tokio::runtime::Handle, params: 
             .text("backend")
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| params.backend.clone());
+        let request_prompt = form.text("prompt");
         // cleanup 欄位:false/0/raw/none → 跳過 cleanup;有給其他值 → 做;沒給 → 用預設。
         let skip_cleanup = match form.text("cleanup").as_deref() {
             Some("false") | Some("0") | Some("raw") | Some("none") => true,
@@ -148,13 +154,21 @@ fn respond_inference(mut req: Request, handle: &tokio::runtime::Handle, params: 
 
         let api_key = params.api_key.clone();
         let prompt_file = params.cleanup_prompt_file.clone();
+        let stt_prompt_file = params.stt_initial_prompt_file.clone();
         let timeout = params.timeout;
 
         let job = async move {
             watchdog::guard(timeout, "service:/inference", async move {
-                let raw =
-                    crate::transcribe_with_fallback(&backend, api_key.as_deref(), &language, wav)
-                        .await?;
+                let initial_prompt =
+                    crate::stt_prompt::resolve(request_prompt.as_deref(), &stt_prompt_file);
+                let raw = crate::transcribe_with_fallback(
+                    &backend,
+                    api_key.as_deref(),
+                    &language,
+                    initial_prompt.as_deref(),
+                    wav,
+                )
+                .await?;
                 if skip_cleanup {
                     return Ok::<String, anyhow::Error>(raw);
                 }

@@ -1,7 +1,10 @@
 // Windows release build:windowless subsystem,避免 autostart 跳黑框 console。
 // 從 terminal 跑時用 AttachConsole(ATTACH_PARENT_PROCESS) 接回父 console,log 照印。
 // Debug build 保留 console,方便 `cargo run` 開發時直接看 log。
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 //! mori-ear:Mori 的「耳朵」器官 — 極簡 CLI。
 //!
@@ -38,6 +41,7 @@ mod local_stt;
 mod multipart;
 mod service;
 mod stt;
+mod stt_prompt;
 mod watchdog;
 
 const DEFAULT_HOTKEY: &str = "Ctrl+Alt+E";
@@ -62,6 +66,11 @@ struct Config {
     /// 每次 cleanup live-read,改 prompt 不必重啟 mori-ear。
     #[serde(default)]
     cleanup_prompt_file: String,
+    /// Whisper/Groq STT initial prompt 來源檔。空時依序讀:
+    /// `~/.mori/mori-ear/stt-initial-prompt.md` → `~/.mori/stt/initial-prompt.md`。
+    /// 這是轉錄 decoder context,不是 cleanup LLM system prompt。
+    #[serde(default)]
+    stt_initial_prompt_file: String,
     /// 轉錄完是否貼進焦點視窗(預設 true,維持舊行為)。
     /// 設 false → 只印 stdout,不碰 clipboard、不按 Ctrl+V — pipe 用法 / headless 場景適用。
     #[serde(default = "default_paste_back")]
@@ -185,6 +194,7 @@ impl Config {
             language: String::new(),
             raw: false,
             cleanup_prompt_file: String::new(),
+            stt_initial_prompt_file: String::new(),
             paste_back: true,
             backend: default_backend(),
             voice_input: VoiceInputConfig::default(),
@@ -254,8 +264,7 @@ fn parse_hotkey(s: &str) -> Result<HotKey> {
             "shift" => mods |= Modifiers::SHIFT,
             "meta" | "super" | "win" | "cmd" => mods |= Modifiers::META,
             key => {
-                let k = key_to_code(key)
-                    .with_context(|| format!("unknown key: {part}"))?;
+                let k = key_to_code(key).with_context(|| format!("unknown key: {part}"))?;
                 code = Some(k);
             }
         }
@@ -266,13 +275,32 @@ fn parse_hotkey(s: &str) -> Result<HotKey> {
 
 fn key_to_code(k: &str) -> Option<Code> {
     Some(match k {
-        "a" => Code::KeyA, "b" => Code::KeyB, "c" => Code::KeyC, "d" => Code::KeyD,
-        "e" => Code::KeyE, "f" => Code::KeyF, "g" => Code::KeyG, "h" => Code::KeyH,
-        "i" => Code::KeyI, "j" => Code::KeyJ, "k" => Code::KeyK, "l" => Code::KeyL,
-        "m" => Code::KeyM, "n" => Code::KeyN, "o" => Code::KeyO, "p" => Code::KeyP,
-        "q" => Code::KeyQ, "r" => Code::KeyR, "s" => Code::KeyS, "t" => Code::KeyT,
-        "u" => Code::KeyU, "v" => Code::KeyV, "w" => Code::KeyW, "x" => Code::KeyX,
-        "y" => Code::KeyY, "z" => Code::KeyZ,
+        "a" => Code::KeyA,
+        "b" => Code::KeyB,
+        "c" => Code::KeyC,
+        "d" => Code::KeyD,
+        "e" => Code::KeyE,
+        "f" => Code::KeyF,
+        "g" => Code::KeyG,
+        "h" => Code::KeyH,
+        "i" => Code::KeyI,
+        "j" => Code::KeyJ,
+        "k" => Code::KeyK,
+        "l" => Code::KeyL,
+        "m" => Code::KeyM,
+        "n" => Code::KeyN,
+        "o" => Code::KeyO,
+        "p" => Code::KeyP,
+        "q" => Code::KeyQ,
+        "r" => Code::KeyR,
+        "s" => Code::KeyS,
+        "t" => Code::KeyT,
+        "u" => Code::KeyU,
+        "v" => Code::KeyV,
+        "w" => Code::KeyW,
+        "x" => Code::KeyX,
+        "y" => Code::KeyY,
+        "z" => Code::KeyZ,
         "space" => Code::Space,
         "enter" | "return" => Code::Enter,
         "tab" => Code::Tab,
@@ -353,7 +381,9 @@ fn spawn_hotkey_thread(hotkey: HotKey, hotkey_label: String) -> Result<()> {
         })
         .context("spawn hotkey thread")?;
 
-    init_rx.recv().context("hotkey thread init channel closed")??;
+    init_rx
+        .recv()
+        .context("hotkey thread init channel closed")??;
     Ok(())
 }
 
@@ -461,24 +491,25 @@ pub(crate) async fn transcribe_with_fallback(
     backend: &str,
     api_key: Option<&str>,
     language: &str,
+    initial_prompt: Option<&str>,
     wav: Vec<u8>,
 ) -> Result<String> {
     match backend {
         "groq" => {
             let key = api_key.context("backend=groq 但無 Groq API key")?;
             info!(backend = "groq", "STT 走 Groq 雲端 Whisper");
-            stt::transcribe(key, language, wav).await
+            stt::transcribe(key, language, initial_prompt, wav).await
         }
-        "local" => local_stt::transcribe_default(language, wav).await,
+        "local" => local_stt::transcribe_default(language, initial_prompt, wav).await,
         _ => {
             // auto:本機優先。本地 whisper-server 拿得到就用(音檔不離機,資料主權);
             // 本地失敗(server 沒起來 / 非 WAV 不可 resample)才退 Groq(有 key 時)。
-            match local_stt::transcribe_default(language, wav.clone()).await {
+            match local_stt::transcribe_default(language, initial_prompt, wav.clone()).await {
                 Ok(t) => Ok(t),
                 Err(e_local) => match api_key {
                     Some(key) => {
                         warn!(error = ?e_local, "本地 whisper-server 不可用 → fallback Groq");
-                        stt::transcribe(key, language, wav).await
+                        stt::transcribe(key, language, initial_prompt, wav).await
                     }
                     None => Err(e_local),
                 },
@@ -497,17 +528,24 @@ async fn batch(input_path: &str) -> Result<ExitCode> {
     }
 
     info!(file = %input_path, backend = %cfg.backend, "batch 模式 — 讀檔送 STT");
-    let bytes = std::fs::read(input_path)
-        .with_context(|| format!("讀 input file 失敗:{input_path}"))?;
+    let bytes =
+        std::fs::read(input_path).with_context(|| format!("讀 input file 失敗:{input_path}"))?;
     if bytes.is_empty() {
         anyhow::bail!("input file 是空檔:{input_path}");
     }
 
     let timeout = Duration::from_secs(cfg.transcribe_timeout_secs);
+    let initial_prompt = stt_prompt::resolve(None, &cfg.stt_initial_prompt_file);
     let raw = watchdog::guard(
         timeout,
         "batch:STT",
-        transcribe_with_fallback(&cfg.backend, api_key.as_deref(), &cfg.language, bytes),
+        transcribe_with_fallback(
+            &cfg.backend,
+            api_key.as_deref(),
+            &cfg.language,
+            initial_prompt.as_deref(),
+            bytes,
+        ),
     )
     .await
     .context("STT 失敗")?;
@@ -557,6 +595,7 @@ async fn serve_only() -> Result<ExitCode> {
             api_key: cfg.resolved_api_key(),
             language: cfg.language.clone(),
             cleanup_prompt_file: cfg.cleanup_prompt_file.clone(),
+            stt_initial_prompt_file: cfg.stt_initial_prompt_file.clone(),
             skip_cleanup_default: cfg.raw,
             timeout: Duration::from_secs(cfg.transcribe_timeout_secs),
         },
@@ -574,8 +613,8 @@ async fn run() -> Result<ExitCode> {
     // BadAccess(global-hotkey 0.6 不會 propagate 那個 error,結果就是用戶
     // 看 log 寫 "ready" 但熱鍵根本沒生效)。先檢查再啟動。
     // (instance 一定要 own,drop 時才釋放鎖,所以 bind 進 local var 撐到 run() 結束)
-    let _instance = single_instance::SingleInstance::new("mori-ear-yazelin")
-        .context("create instance lock")?;
+    let _instance =
+        single_instance::SingleInstance::new("mori-ear-yazelin").context("create instance lock")?;
     if !_instance.is_single() {
         // OS-specific restart hint —— Linux/macOS 是 abstract socket / lock file,
         // Windows 是 named mutex(`single-instance` 內部分流),命令也不同。
@@ -599,7 +638,8 @@ async fn run() -> Result<ExitCode> {
             "backend=groq 但無 Groq API key — 設 GROQ_API_KEY / 寫進 ~/.mori/config.json 的 providers.groq.api_key,或把 backend 設成 auto/local"
         );
     }
-    let hotkey = parse_hotkey(&cfg.hotkey).with_context(|| format!("parse hotkey: {}", cfg.hotkey))?;
+    let hotkey =
+        parse_hotkey(&cfg.hotkey).with_context(|| format!("parse hotkey: {}", cfg.hotkey))?;
 
     info!(hotkey = %cfg.hotkey, backend = %cfg.backend, "mori-ear ready — 按住熱鍵說話、放開停止");
 
@@ -623,6 +663,7 @@ async fn run() -> Result<ExitCode> {
     let lang_arc = Arc::new(cfg.language.clone());
     let raw_arc = Arc::new(cfg.raw);
     let prompt_file_arc = Arc::new(cfg.cleanup_prompt_file.clone());
+    let stt_initial_prompt_file_arc = Arc::new(cfg.stt_initial_prompt_file.clone());
     let paste_back_arc = Arc::new(cfg.paste_back);
     let backend_arc = Arc::new(cfg.backend.clone());
     let trim_cfg = cfg.voice_input.to_trim(); // Copy,每輪傳值即可
@@ -639,6 +680,7 @@ async fn run() -> Result<ExitCode> {
                 api_key: (*api_key_arc).clone(),
                 language: cfg.language.clone(),
                 cleanup_prompt_file: cfg.cleanup_prompt_file.clone(),
+                stt_initial_prompt_file: cfg.stt_initial_prompt_file.clone(),
                 skip_cleanup_default: cfg.raw,
                 timeout: transcribe_timeout,
             },
@@ -671,6 +713,7 @@ async fn run() -> Result<ExitCode> {
                         lang_arc.clone(),
                         raw_arc.clone(),
                         prompt_file_arc.clone(),
+                        stt_initial_prompt_file_arc.clone(),
                         paste_back_arc.clone(),
                         backend_arc.clone(),
                         trim_cfg,
@@ -808,10 +851,19 @@ fn detect_active_window_process_linux() -> Option<String> {
 fn needs_shift_for_paste(process_name: &str) -> bool {
     let p = process_name.to_lowercase();
     [
-        "gnome-terminal", "kgx", "ptyxis",
-        "kitty", "alacritty", "wezterm",
-        "foot", "tilix", "terminator", "xterm",
-        "konsole", "urxvt", "rxvt",
+        "gnome-terminal",
+        "kgx",
+        "ptyxis",
+        "kitty",
+        "alacritty",
+        "wezterm",
+        "foot",
+        "tilix",
+        "terminator",
+        "xterm",
+        "konsole",
+        "urxvt",
+        "rxvt",
     ]
     .iter()
     .any(|t| p.contains(t))
@@ -855,9 +907,7 @@ fn write_clipboard_unicode_windows(text: &str) -> anyhow::Result<()> {
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{
-        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
-    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Ole::CF_UNICODETEXT;
 
     // RAII guard 確保中途 ? 早退也會 CloseClipboard —— Windows clipboard 是全 OS
@@ -889,8 +939,7 @@ fn write_clipboard_unicode_windows(text: &str) -> anyhow::Result<()> {
         std::ptr::copy_nonoverlapping(wide.as_ptr(), dst as *mut u16, wide.len());
         let _ = GlobalUnlock(h_mem);
         // SetClipboardData 後 h_mem 所有權歸 OS,不要再用
-        SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(h_mem.0))
-            .context("SetClipboardData")?;
+        SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(h_mem.0)).context("SetClipboardData")?;
     }
     Ok(())
 }
@@ -898,8 +947,8 @@ fn write_clipboard_unicode_windows(text: &str) -> anyhow::Result<()> {
 #[cfg(target_os = "windows")]
 fn send_paste_keys_windows(use_shift: bool) -> anyhow::Result<()> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-        KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_SHIFT, VK_V,
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+        VIRTUAL_KEY, VK_CONTROL, VK_SHIFT, VK_V,
     };
 
     fn make_key(vk: VIRTUAL_KEY, key_up: bool) -> INPUT {
@@ -949,9 +998,7 @@ fn detect_active_window_process_windows() -> Option<String> {
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
     let hwnd = unsafe { GetForegroundWindow() };
     if hwnd.0.is_null() {
@@ -964,8 +1011,7 @@ fn detect_active_window_process_windows() -> Option<String> {
         return None;
     }
 
-    let handle =
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
 
     let mut buf = vec![0u16; MAX_PATH as usize];
     let mut size = buf.len() as u32;
@@ -999,10 +1045,14 @@ fn detect_active_window_process_windows() -> Option<String> {
 fn needs_shift_for_paste_windows(process_name: &str) -> bool {
     let p = process_name.to_lowercase();
     [
-        "windowsterminal", "wt",       // Windows Terminal
-        "alacritty", "kitty", "wezterm", // 跨平台
-        "mintty",                       // Git Bash / Cygwin
-        "conemu", "cmder",              // 第三方 console
+        "windowsterminal",
+        "wt", // Windows Terminal
+        "alacritty",
+        "kitty",
+        "wezterm", // 跨平台
+        "mintty",  // Git Bash / Cygwin
+        "conemu",
+        "cmder", // 第三方 console
     ]
     .iter()
     .any(|t| p.contains(t))
@@ -1016,6 +1066,7 @@ async fn handle_event(
     language: Arc<String>,
     skip_cleanup: Arc<bool>,
     cleanup_prompt_file: Arc<String>,
+    stt_initial_prompt_file: Arc<String>,
     paste_back_enabled: Arc<bool>,
     backend: Arc<String>,
     trim: audio::TrimConfig,
@@ -1050,14 +1101,13 @@ async fn handle_event(
             };
             // 安靜 / 太短的 audio Whisper 會幻覺出「謝謝」「請訂閱」等,直接 skip
             const MIN_DURATION: f32 = 0.25; // 0.25s 以下視為熱鍵誤觸(快按下又放開,沒實際說話)
-                                             // 註:單音節中文「好 / 對 / 是」一般 0.25~0.35s
-                                             //     講太快被擋的話再下調 0.18
+                                            // 註:單音節中文「好 / 對 / 是」一般 0.25~0.35s
+                                            //     講太快被擋的話再下調 0.18
             const MIN_RMS_DB: f32 = -45.0; // -45 dB 以下視為靜音(背景噪音通常 -50 ~ -55 dB)
             if duration_secs < MIN_DURATION || rms_db < MIN_RMS_DB {
                 info!(
                     duration_secs,
-                    rms_db,
-                    "錄音太短或太安靜,skip STT(避免 Whisper 幻覺「謝謝」之類)"
+                    rms_db, "錄音太短或太安靜,skip STT(避免 Whisper 幻覺「謝謝」之類)"
                 );
                 return;
             }
@@ -1067,8 +1117,15 @@ async fn handle_event(
                 // STT(+cleanup)整段包進看門狗:逾時(transcribe_timeout_secs,預設 90s)就
                 // 放棄這句、不讓一輪卡住的轉譯把 daemon 拖住。
                 let text = match watchdog::guard(timeout, "hotkey:STT", async move {
-                    let raw =
-                        transcribe_with_fallback(&backend, api_key.as_deref(), &language, wav).await?;
+                    let initial_prompt = stt_prompt::resolve(None, &stt_initial_prompt_file);
+                    let raw = transcribe_with_fallback(
+                        &backend,
+                        api_key.as_deref(),
+                        &language,
+                        initial_prompt.as_deref(),
+                        wav,
+                    )
+                    .await?;
 
                     // Step 2:LLM cleanup(繁中校正 + 標點 + 簡轉繁)。需 Groq key;
                     // skip_cleanup 或無 key(離線)→ 直接用 raw。cleanup 失敗也 fallback raw。
@@ -1122,10 +1179,12 @@ async fn handle_event(
                         }
                     }
                 } else {
-                    info!(chars = text.chars().count(), "✓ 轉錄完成(paste-back 關閉,只印 stdout)");
+                    info!(
+                        chars = text.chars().count(),
+                        "✓ 轉錄完成(paste-back 關閉,只印 stdout)"
+                    );
                 }
             });
         }
     }
 }
-

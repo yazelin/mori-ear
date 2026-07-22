@@ -81,25 +81,33 @@ Start-Process mori-ear
 
 #### 路徑 A — Prebuilt
 
+tarball 內含 `mori-ear` binary + `ear.sh` + `install-autostart.sh`,不需要 clone repo。
+
 ```sh
-# 0. 設 Groq key 跟 paste-back deps
-export GROQ_API_KEY=gsk_xxxxx     # 或寫進 ~/.mori/config.json
-sudo apt install xclip xdotool    # X11 paste-back 必裝
-sudo apt install wl-clipboard ydotool          # Wayland paste-back 必裝
-sudo systemctl --user enable --now ydotool
-sudo usermod -aG input "$USER"                 # 加完要重新登入
+# 0. 設 Groq key(或寫進 ~/.mori/config.json 跟 mori-desktop 共用)
+export GROQ_API_KEY=gsk_xxxxx
 
-# 1. 從 https://github.com/yazelin/mori-ear/actions 下載最新 mori-ear-linux-x86_64
+#    paste-back 依賴 —— 依你的 session 裝其中一組(不確定就跑 ./ear.sh deps 問它)
+sudo apt install xclip xdotool                 # X11
+sudo apt install wl-clipboard ydotool          # Wayland
+sudo systemctl --user enable --now ydotool     # Wayland:paste-back 靠這個 daemon
+sudo usermod -aG input "$USER"                 # Wayland:加完必須重新登入才生效
+
+# 1. 從 https://github.com/yazelin/mori-ear/releases 下載最新 tar.gz
 tar -xzf mori-ear-linux-x86_64.tar.gz
-sudo install -m 755 mori-ear /usr/local/bin/mori-ear     # 或丟 ~/.local/bin/
+mkdir -p ~/.local/bin && install -m 755 mori-ear ~/.local/bin/    # 免 sudo
+#   或系統層:sudo install -m 755 mori-ear /usr/local/bin/
 
-# 2. 登入後自動啟動(XDG autostart entry)
-git clone https://github.com/yazelin/mori-ear /tmp/mori-ear-src
-bash /tmp/mori-ear-src/scripts/install-autostart.sh
+# 2. 一鍵裝好其餘三層(autostart + GNOME 快捷鍵 + 啟動)
+./ear.sh install
 
-# 3. 馬上跑(下次登入 XDG entry 會自動跑)
-mori-ear &
+# 3. (選)把 ear 放進 PATH,之後就能直接打 `ear status` / `ear log`
+install -m 755 ear.sh ~/.local/bin/ear
 ```
+
+`ear.sh` 會自己找 binary(`MORI_EAR_BIN` → `~/.cargo/bin` → `PATH`),所以裝在哪都認得。
+
+**Wayland 首次啟動會跳授權對話框**(「mori-ear 想註冊 Ctrl+Alt+E」)—— 要按同意熱鍵才生效。
 
 #### 路徑 B — From source
 

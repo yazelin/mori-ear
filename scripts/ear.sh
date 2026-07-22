@@ -42,7 +42,32 @@ else
     REPO="$HOME/mori-universe/mori-ear"
 fi
 
-BIN="$HOME/.cargo/bin/mori-ear"
+# binary 位置。三種安裝路徑會放在不同地方,所以要找而不是寫死:
+#   - 路徑 B(from source):`cargo install` → ~/.cargo/bin/mori-ear
+#   - 路徑 A(prebuilt):README 教的是 /usr/local/bin 或 ~/.local/bin
+#   - 自訂:MORI_EAR_BIN 環境變數覆寫
+# 寫死 ~/.cargo/bin 的話,prebuilt 使用者的 `ear status` 會回報「NOT INSTALLED」
+# 而其實 binary 好好的在 PATH 裡 —— 純粹的假警報。
+if [[ -n "${MORI_EAR_BIN:-}" ]]; then
+    BIN="$MORI_EAR_BIN"
+elif [[ -x "$HOME/.cargo/bin/mori-ear" ]]; then
+    BIN="$HOME/.cargo/bin/mori-ear"
+elif command -v mori-ear >/dev/null 2>&1; then
+    BIN=$(command -v mori-ear)
+else
+    # 都找不到 → 用 cargo install 的目標位置當「該裝到哪」的預設
+    BIN="$HOME/.cargo/bin/mori-ear"
+fi
+
+# install-autostart.sh 的位置。tarball 解壓後它跟 ear.sh 同層(平的),
+# repo 裡則同在 scripts/ 底下 —— 兩種都是「跟我同一個目錄」,所以先找那裡,
+# 找不到才退回 repo 路徑(symlink 進 PATH 的情境)。
+if [[ -f "$_SCRIPT_DIR/install-autostart.sh" ]]; then
+    AUTOSTART_SCRIPT="$_SCRIPT_DIR/install-autostart.sh"
+else
+    AUTOSTART_SCRIPT="$REPO/scripts/install-autostart.sh"
+fi
+
 LOG_OUT="/tmp/mori-ear.out"
 LOG_ERR="/tmp/mori-ear.err"
 AUTOSTART_DESKTOP="$HOME/.config/autostart/mori-ear.desktop"
@@ -197,9 +222,9 @@ cmd_log() {
 }
 
 cmd_autostart() {
-    local script="$REPO/scripts/install-autostart.sh"
+    local script="$AUTOSTART_SCRIPT"
     if [[ ! -f "$script" ]]; then
-        echo "❌ install-autostart.sh 不在 $script — source repo 不存在?"
+        echo "❌ install-autostart.sh 找不到(試過 $_SCRIPT_DIR/ 跟 $REPO/scripts/)"
         return 1
     fi
     case "${1:-}" in
@@ -283,8 +308,10 @@ cmd_install() {
         echo "  [2/5] ✓ binary 已在 $BIN(跳過 cargo install)"
     else
         if [[ ! -d "$REPO" ]]; then
-            echo "  [2/5] ❌ source repo 不在 $REPO"
-            echo "        先 clone:git clone https://github.com/yazelin/mori-ear $REPO"
+            echo "  [2/5] ❌ 找不到 binary,也沒有 source repo($REPO)"
+            echo "        從原始碼裝:git clone https://github.com/yazelin/mori-ear $REPO && ear install"
+            echo "        用 prebuilt: 從 https://github.com/yazelin/mori-ear/releases 下載 tar.gz,"
+            echo "                     解壓後 install -m 755 mori-ear ~/.local/bin/ 再跑 ./ear.sh install"
             return 1
         fi
         echo "  [2/5] → cargo install --path $REPO (1-2 分鐘)"
@@ -295,7 +322,7 @@ cmd_install() {
         echo "  [3/5] ✓ autostart 已裝(跳過)"
     else
         echo "  [3/5] → 裝開機自動啟動"
-        bash "$REPO/scripts/install-autostart.sh" >/dev/null
+        bash "$AUTOSTART_SCRIPT" >/dev/null
         echo "        ✓ $AUTOSTART_DESKTOP"
     fi
 
@@ -371,8 +398,12 @@ cmd_uninstall() {
     fi
 
     if binary_installed; then
-        rm -f "$BIN"
-        echo "✓ binary 移除"
+        if rm -f "$BIN" 2>/dev/null; then
+            echo "✓ binary 移除"
+        else
+            echo "⚠ binary 刪不掉(權限?):$BIN"
+            echo "  手動:sudo rm -f $BIN"
+        fi
     fi
 
     if [[ -f "$PORTAL_DESKTOP" ]]; then

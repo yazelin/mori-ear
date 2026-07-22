@@ -52,10 +52,16 @@ jobs:
         run: cargo build --release --locked
 
       - name: Package Linux binary
+        # 附上 ear.sh + install-autostart.sh:Windows zip 一直有帶 .ps1,Linux 卻只給
+        # binary,結果 README 的 prebuilt 流程還得叫使用者「再 clone 一份 repo 拿腳本」
+        # —— 那就失去 prebuilt 的意義了。兩支腳本都能獨立於 repo 運作(自己找 binary)。
         if: runner.os == 'Linux'
         run: |
-          mkdir -p dist
-          tar -czf dist/mori-ear-linux-x86_64.tar.gz -C target/release mori-ear
+          mkdir -p dist stage
+          cp target/release/mori-ear stage/
+          cp scripts/ear.sh scripts/install-autostart.sh stage/
+          chmod +x stage/ear.sh stage/install-autostart.sh
+          tar -czf dist/mori-ear-linux-x86_64.tar.gz -C stage .
 
       - name: Package Windows binary
         if: runner.os == 'Windows'

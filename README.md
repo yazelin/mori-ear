@@ -149,18 +149,23 @@ ln -s "$PWD/scripts/ear.sh" ~/.local/bin/ear
 ear install
 ```
 
-`ear install` 會做四件事(任一已裝就 skip):
-1. `cargo install --path .` 編譯 + 裝 binary
-2. `bash scripts/install-autostart.sh` 寫 XDG autostart entry
-3. `gsettings` 綁 Ctrl+Shift+Alt+E → `ear toggle`(GNOME)
-4. nohup 啟動 process
+`ear install` 會做五件事(任一已裝就 skip):
+1. **檢查 paste-back 依賴** — 依 X11 / Wayland 分別檢查,缺什麼直接印 `apt install` 指令
+2. `cargo install --path .` 編譯 + 裝 binary
+3. `bash scripts/install-autostart.sh` 寫 XDG autostart entry
+4. `gsettings` 綁 Ctrl+Shift+Alt+E → `ear toggle`(GNOME)
+5. nohup 啟動 process
+
+依賴缺了**不會擋安裝** —— binary、熱鍵、stdout 都還是能用,只是字貼不進焦點視窗。
+補完後跑 `ear deps` 重新確認。
 
 日常用:
 
 ```sh
 ear              # toggle(沒跑就開、跑就停)— 跟 Ctrl+Shift+Alt+E 同等
 ear on / off     # 明確開 / 關
-ear status       # 看 process + 各層安裝狀態
+ear status       # 看 process + 各層安裝狀態 + paste-back 依賴
+ear deps         # 只檢查 paste-back 依賴(自動分辨 X11 / Wayland)
 ear log          # tail /tmp/mori-ear.err
 ear keybind on|off    # 只動 GNOME 快捷鍵
 ear autostart on|off  # 只動開機自動啟用
@@ -168,6 +173,13 @@ ear uninstall    # 反過來全套拆(會問你確認;`ear uninstall --yes` 跳�
 ```
 
 需要 `python3` + `gsettings` + `notify-send`(Ubuntu / Fedora / Arch 預設都有)。非 GNOME 桌面 keybind 段自動 skip,其他層照常 work。
+
+paste-back 的外部依賴依 session 分兩組,`ear deps` 會自己判斷該檢查哪組:
+
+| session | 需要 | 額外條件 |
+|---|---|---|
+| **X11** | `xclip` + `xdotool` | — |
+| **Wayland** | `wl-clipboard` + `ydotool` | `ydotoold` 服務要在跑、使用者要在 `input` 群組(加完**必須重新登入**) |
 
 預設快捷鍵 `<Ctrl><Shift><Alt>e`,要換改 `scripts/ear.sh` 頂端 `GS_BINDING` 後重跑 `ear keybind off && ear keybind on`。
 

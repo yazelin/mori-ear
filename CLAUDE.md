@@ -35,6 +35,7 @@ src/
   watchdog.rs    — per-transcription timeout guard (+ ChildGuard for future local children)
   multipart.rs   — minimal multipart/form-data parser for POST /inference
 scripts/
+  ear.sh                 — Linux one-shot wrapper (install/status/deps/keybind/autostart/toggle)
   install-autostart.ps1  — Windows scheduled task (self-elevating)
   remove-autostart.ps1   — delegates to install -Remove
   install-autostart.sh   — Linux XDG autostart entry
@@ -96,6 +97,12 @@ Do NOT run both sources at once. `run()` only starts the X11 bridge when the por
 X11 walks `xdotool getactivewindow` → `/proc/<pid>/comm` to pick Ctrl+V vs Ctrl+Shift+V. Wayland deliberately denies clients any focused-window query (GNOME 45+ closed the Shell `Eval` escape hatch too), so that detection is **impossible** here — hence the `paste_key` config field. Default `ctrl+v`; terminal users must set `ctrl+shift+v` themselves. Don't try to reintroduce auto-detection without a working mechanism.
 
 `paste_back_wayland` uses `wl-copy` + `ydotool` (virtual keyboard via `/dev/uinput`, so Wayland-native windows accept it). It needs `ydotoold` running and the user in the `input` group; on failure it falls back to the X11 path, which still helps hybrid setups (mori-desktop forces `GDK_BACKEND=x11`, so its windows are XWayland).
+
+### Linux: paste-back deps are session-dependent, and `ear.sh` is where that's checked
+
+The binary can install cleanly, autostart fine, and the hotkey can fire — and paste-back still does nothing, because it shells out to external tools that differ per session: X11 needs `xclip` + `xdotool`, Wayland needs `wl-clipboard` + `ydotool` **plus** a running `ydotoold` and the user in the `input` group (which only takes effect after a re-login). Nothing in the Rust code can fix a missing package, so `check_deps` in `scripts/ear.sh` reports it at install time instead of letting the user discover it mid-sentence.
+
+Missing deps are deliberately **non-fatal** to `ear install` — stdout still carries the transcript, so the daemon is useful without paste-back. If you add a new external command to any paste-back path, add it to `check_deps` in the matching session branch, or it becomes another silent failure.
 
 ### Linux: single-instance + restart timing
 

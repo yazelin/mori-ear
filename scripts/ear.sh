@@ -10,9 +10,10 @@
 #   ear on           # 啟動
 #   ear off          # 停掉
 #   ear toggle       # 同上
-#   ear status       # 看在不在跑、binary 時間、各層安裝狀態
+#   ear status       # 看在不在跑、binary 時間、各層安裝狀態、paste-back 依賴
+#   ear deps         # 只檢查 paste-back 外部依賴(依 X11 / Wayland 分別檢查)
 #   ear log          # tail 最近 log
-#   ear install      # 一鍵全套裝(binary + autostart + GNOME 快捷鍵 + 啟動)
+#   ear install      # 一鍵全套裝(依賴檢查 + binary + autostart + GNOME 快捷鍵 + 啟動)
 #   ear uninstall    # 一鍵反過來全套拆(會問你確認;--yes 跳過)
 #   ear autostart on|off  # 只開/關 開機自動啟用(不動 binary 跟快捷鍵)
 #   ear keybind on|off    # 只綁/解 GNOME Ctrl+Shift+Alt+E 快捷鍵
@@ -20,6 +21,12 @@
 #
 # 設計:四層彼此獨立,各層可單獨開關。`install` / `uninstall` 是便利包裝。
 # 平台:Linux + GNOME 主測。非 GNOME 桌面 keybind 段會自動 skip(不影響其他層)。
+#
+# paste-back 依賴依 session 分兩組,`install` / `status` / `deps` 會自動判斷:
+#   X11     — xclip + xdotool
+#   Wayland — wl-clipboard + ydotool,且 ydotoold 要在跑、使用者要在 input 群組
+# 熱鍵來源也跟著 session 走:X11 是 XGrabKey,Wayland 是 GlobalShortcuts portal
+# (首次啟動要按同意授權)。
 
 set -u
 
@@ -100,6 +107,59 @@ keybind_installed() {
     [[ "$(gsettings get $GS_SCHEMA custom-keybindings 2>/dev/null)" == *"mori-ear-toggle"* ]]
 }
 
+is_wayland() {
+    [[ "${XDG_SESSION_TYPE,,}" == wayland || -n "${WAYLAND_DISPLAY:-}" ]]
+}
+
+# paste-back 的外部依賴檢查。
+#
+# 為什麼需要:mori-ear 的 binary 裝好、autostart 綁好、熱鍵響了,paste-back 還是
+# 可能整條啞掉 —— 它靠的是外部指令(X11 走 xclip+xdotool,Wayland 走
+# wl-copy+ydotool),缺了只會在轉錄完那一刻才失敗。裝的時候就講清楚,
+# 比讓使用者對著「log 說轉錄成功但字沒出現」瞎猜好。
+#
+# Wayland 那組特別容易漏:ydotool 光裝套件不夠,還要 ydotoold 這個 daemon 在跑、
+# 使用者在 input 群組(才有 /dev/uinput 權限),而且**加群組要重新登入才生效**。
+#
+# 回傳:0 = 全齊,1 = 有缺(印出修法)。純檢查,不自己 sudo 裝東西。
+check_deps() {
+    local missing=() hints=() ok=1
+    if is_wayland; then
+        echo "  session:   Wayland(熱鍵走 GlobalShortcuts portal)"
+        command -v wl-copy  >/dev/null 2>&1 || { missing+=("wl-clipboard"); ok=0; }
+        command -v ydotool  >/dev/null 2>&1 || { missing+=("ydotool");      ok=0; }
+        if command -v ydotool >/dev/null 2>&1; then
+            if ! systemctl --user is-active --quiet ydotool 2>/dev/null; then
+                hints+=("ydotoold 沒在跑:sudo systemctl --user enable --now ydotool")
+                ok=0
+            fi
+            if ! id -nG | tr ' ' '\n' | grep -qx input; then
+                hints+=("你不在 input 群組(ydotool 要 /dev/uinput):sudo usermod -aG input \"\$USER\" —— 加完必須重新登入")
+                ok=0
+            fi
+        fi
+        # XWayland fallback 用得到,缺了不致命
+        command -v xdotool >/dev/null 2>&1 || \
+            hints+=("(選用)xdotool 缺 — Wayland paste-back 失敗時的 XWayland 退路會一起沒有")
+    else
+        echo "  session:   X11(熱鍵走 XGrabKey)"
+        command -v xclip   >/dev/null 2>&1 || { missing+=("xclip");   ok=0; }
+        command -v xdotool >/dev/null 2>&1 || { missing+=("xdotool"); ok=0; }
+    fi
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "  依賴:     ✗ 缺 ${missing[*]}"
+        echo "             sudo apt install ${missing[*]}"
+    elif [[ $ok -eq 1 ]]; then
+        echo "  依賴:     ✓ paste-back 依賴齊全"
+    else
+        echo "  依賴:     ⚠ 套件有裝但設定沒到位"
+    fi
+    local h
+    for h in "${hints[@]}"; do echo "             $h"; done
+    [[ $ok -eq 1 ]]
+}
+
 cmd_status() {
     if is_running; then
         local pid; pid=$(pgrep -x mori-ear | head -1)
@@ -123,6 +183,7 @@ cmd_status() {
     else
         echo "  keybind:   ✗ not bound"
     fi
+    check_deps || true
 }
 
 cmd_log() {
@@ -203,49 +264,68 @@ cmd_keybind() {
 }
 
 cmd_install() {
-    echo "→ 安裝 mori-ear(4 層,已裝的會跳過)"
+    echo "→ 安裝 mori-ear(5 層,已裝的會跳過)"
     echo
 
+    # 先檢查再裝:缺依賴不擋安裝(binary / 熱鍵 / stdout 都還是能用),
+    # 但要在使用者還盯著畫面時就說清楚,而不是等第一次講完話發現字沒貼進去。
+    echo "  [1/5] → 檢查 paste-back 依賴"
+    local deps_ok=1
+    check_deps || deps_ok=0
+
     if binary_installed; then
-        echo "  [1/4] ✓ binary 已在 $BIN(跳過 cargo install)"
+        echo "  [2/5] ✓ binary 已在 $BIN(跳過 cargo install)"
     else
         if [[ ! -d "$REPO" ]]; then
-            echo "  [1/4] ❌ source repo 不在 $REPO"
+            echo "  [2/5] ❌ source repo 不在 $REPO"
             echo "        先 clone:git clone https://github.com/yazelin/mori-ear $REPO"
             return 1
         fi
-        echo "  [1/4] → cargo install --path $REPO (1-2 分鐘)"
+        echo "  [2/5] → cargo install --path $REPO (1-2 分鐘)"
         (cd "$REPO" && cargo install --path . --force) || { echo "❌ cargo install 失敗"; return 1; }
     fi
 
     if autostart_installed; then
-        echo "  [2/4] ✓ autostart 已裝(跳過)"
+        echo "  [3/5] ✓ autostart 已裝(跳過)"
     else
-        echo "  [2/4] → 裝開機自動啟動"
+        echo "  [3/5] → 裝開機自動啟動"
         bash "$REPO/scripts/install-autostart.sh" >/dev/null
         echo "        ✓ $AUTOSTART_DESKTOP"
     fi
 
     if keybind_installed; then
-        echo "  [3/4] ✓ GNOME 快捷鍵已綁(跳過)"
+        echo "  [4/5] ✓ GNOME 快捷鍵已綁(跳過)"
     else
-        echo "  [3/4] → 綁 Ctrl+Shift+Alt+E"
+        echo "  [4/5] → 綁 Ctrl+Shift+Alt+E"
         cmd_keybind on >/dev/null
         echo "        ✓ 按 Ctrl+Shift+Alt+E 開/關"
     fi
 
     if is_running; then
-        echo "  [4/4] ✓ process 已在跑(PID $(pgrep -x mori-ear | head -1))"
+        echo "  [5/5] ✓ process 已在跑(PID $(pgrep -x mori-ear | head -1))"
     else
-        echo "  [4/4] → 啟動 mori-ear"
+        echo "  [5/5] → 啟動 mori-ear"
         cmd_on >/dev/null
     fi
 
     echo
-    echo "✓ 完整安裝完成"
+    if [[ $deps_ok -eq 1 ]]; then
+        echo "✓ 完整安裝完成"
+    else
+        echo "⚠ 安裝完成,但 paste-back 依賴沒齊 —— 轉錄會成功、字貼不進焦點視窗"
+        echo '  (stdout 仍照印,ear log 看得到轉錄結果)'
+        echo '  補完上面那幾條後跑 ear deps 重新確認'
+    fi
     echo "  按住 Ctrl+Alt+E 講話、放開貼字"
     echo "  按 Ctrl+Shift+Alt+E toggle on/off"
     echo "  ear status — 看狀態"
+    if is_wayland; then
+        echo
+        echo "  Wayland 提醒:第一次啟動會跳授權對話框(「mori-ear 想註冊 Ctrl+Alt+E」),"
+        echo "  要按同意熱鍵才會生效。同意後綁定由 compositor 保管 —— 之後改 ear.json"
+        echo "  的 hotkey 不會生效,要去「設定 → 鍵盤 → 檢視及自訂快捷鍵」改。"
+        echo '  ear log 開頭那行 actual= 會顯示實際綁到哪組鍵。'
+    fi
 }
 
 cmd_uninstall() {
@@ -315,6 +395,7 @@ case "${1:-toggle}" in
     off|stop)         cmd_off ;;
     toggle|"")        cmd_toggle ;;
     status|st)        cmd_status ;;
+    deps|dep)         check_deps ;;
     log|logs)         cmd_log ;;
     install)          cmd_install ;;
     uninstall|remove) cmd_uninstall "${2:-}" ;;

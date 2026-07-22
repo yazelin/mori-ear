@@ -47,6 +47,12 @@ LOG_OUT="/tmp/mori-ear.out"
 LOG_ERR="/tmp/mori-ear.err"
 AUTOSTART_DESKTOP="$HOME/.config/autostart/mori-ear.desktop"
 
+# Wayland portal 產物。mori-ear 走 GlobalShortcuts portal 時會自己寫這個 desktop
+# entry(GNOME 要有它才肯放行 app id 註冊),移除時要跟著清 —— 留著會變成選單裡
+# 指向已刪 binary 的孤兒。APP_ID 必須跟 src/wayland_hotkey.rs 的常數一致。
+PORTAL_APP_ID="ai.yazelin.mori-ear"
+PORTAL_DESKTOP="$HOME/.local/share/applications/$PORTAL_APP_ID.desktop"
+
 GS_SCHEMA="org.gnome.settings-daemon.plugins.media-keys"
 GS_KEY_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/mori-ear-toggle/"
 GS_BINDING='<Ctrl><Shift><Alt>e'
@@ -334,6 +340,7 @@ cmd_uninstall() {
     keybind_installed     && echo "  • GNOME 快捷鍵 Ctrl+Shift+Alt+E"
     autostart_installed   && echo "  • 開機自動啟動 $AUTOSTART_DESKTOP"
     binary_installed      && echo "  • binary $BIN"
+    [[ -f "$PORTAL_DESKTOP" ]] && echo "  • Wayland portal desktop entry $PORTAL_DESKTOP"
     echo "  • ear wrapper symlink / copy:$(readlink -f "$0")"
     echo
     echo "不會動(共用 / 你的資料):"
@@ -368,6 +375,13 @@ cmd_uninstall() {
         echo "✓ binary 移除"
     fi
 
+    if [[ -f "$PORTAL_DESKTOP" ]]; then
+        rm -f "$PORTAL_DESKTOP"
+        command -v update-desktop-database >/dev/null 2>&1 && \
+            update-desktop-database "$(dirname "$PORTAL_DESKTOP")" 2>/dev/null || true
+        echo "✓ Wayland portal desktop entry 移除"
+    fi
+
     # 自我刪除:Linux unlink 不影響跑中的 process,kernel 開著 fd 跑完 script 沒問題。
     # 注意 readlink -f 解到實體位置;如果是 symlink,實際刪到 repo 的 scripts/ear.sh —
     # 那不是 user 想要的,要改刪 symlink 本身($0,未 resolve)。
@@ -384,6 +398,14 @@ cmd_uninstall() {
     echo
     echo "✓ mori-ear 完整移除"
     echo "  徹底乾淨還要:rm -f ~/.mori/ear.json; rm -rf $REPO"
+    if is_wayland; then
+        echo
+        echo "  注意:portal 的熱鍵授權由 compositor 保管,上面刪不掉 ——"
+        echo "  留著的話重裝時不會再跳授權對話框(直接沿用舊綁定)。要真正回到"
+        echo "  「沒裝過」的狀態,再刪授權紀錄:"
+        echo "    rm -rf ~/.local/share/xdg-desktop-portal/permissions*"
+        echo "  (那份是所有 app 的 portal 授權,刪掉別的 app 也要重新授權一次)"
+    fi
 }
 
 cmd_help() {

@@ -1,6 +1,6 @@
 [package]
 name = "mori-ear"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Mori 的耳朵 — 極簡 CLI:全域熱鍵 → 錄音 → STT → stdout"
 license = "MIT OR Apache-2.0"

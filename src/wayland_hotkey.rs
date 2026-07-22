@@ -171,7 +171,17 @@ pub async fn spawn(hotkey: &str, tx: UnboundedSender<KeyEdge>) -> Result<Handle>
 
     // 兩條 signal stream 併成一條 KeyEdge 流。用 select! 而非兩條 task,
     // 是為了讓 tx 關閉(主 loop 結束)時兩邊一起收工。
+    //
+    // `held` 是**去彈跳**,不是防禦性寫法:GNOME 的 portal 會把鍵盤自動重複
+    // 原樣轉成一連串 Activated —— 實測按住 15 秒會收到約 490 個(~30ms 一個,
+    // 正好是 auto-repeat 頻率)。下游 handle_event 雖然有「已在錄音中就忽略」
+    // 的守衛擋著、功能不受影響,但每個都會印一行 WARN,一次錄音就把 log 洗掉
+    // (`ear log` 是 tail -30,結果全是雜訊、看不到轉錄結果)。
+    //
+    // 在源頭收斂成真正的邊緣事件,下游才拿得到「按下一次 = 一個 Pressed」的保證,
+    // 也不必依賴各家 compositor 的重複行為一致。
     tokio::spawn(async move {
+        let mut held = false;
         loop {
             let edge = tokio::select! {
                 Some(ev) = activated.next() => {
@@ -179,6 +189,10 @@ pub async fn spawn(hotkey: &str, tx: UnboundedSender<KeyEdge>) -> Result<Handle>
                         debug!(id = %ev.shortcut_id(), "忽略非本 shortcut 的 Activated");
                         continue;
                     }
+                    if held {
+                        continue; // auto-repeat,不是新的按下
+                    }
+                    held = true;
                     KeyEdge::Pressed
                 }
                 Some(ev) = deactivated.next() => {
@@ -186,6 +200,13 @@ pub async fn spawn(hotkey: &str, tx: UnboundedSender<KeyEdge>) -> Result<Handle>
                         debug!(id = %ev.shortcut_id(), "忽略非本 shortcut 的 Deactivated");
                         continue;
                     }
+                    if !held {
+                        // 沒按下卻收到放開 —— 綁定期間就按著、或 compositor 補送。
+                        // 往下傳會讓 handle_event 對著空的 recorder slot 做事,直接吞掉。
+                        debug!("收到 Deactivated 但目前不是按下狀態,忽略");
+                        continue;
+                    }
+                    held = false;
                     KeyEdge::Released
                 }
                 else => {

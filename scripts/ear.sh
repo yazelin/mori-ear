@@ -414,13 +414,18 @@ cmd_uninstall() {
     fi
 
     # 自我刪除:Linux unlink 不影響跑中的 process,kernel 開著 fd 跑完 script 沒問題。
-    # 注意 readlink -f 解到實體位置;如果是 symlink,實際刪到 repo 的 scripts/ear.sh —
-    # 那不是 user 想要的,要改刪 symlink 本身($0,未 resolve)。
+    #
+    # 判斷必須用 `-L`(真的是 symlink 嗎),不能用 `$0 != $(readlink -f $0)` ——
+    # 後者在 $0 只是**相對路徑**時也成立,於是 `bash scripts/ear.sh uninstall`
+    # 會走進「刪 symlink」分支、把 repo 裡的本體刪掉,還印訊息說 repo 內保留。
+    # (這個 bug 真的發生過,靠 git checkout 才救回來。)
     local self_resolved; self_resolved=$(readlink -f "$0")
-    if [[ "$0" != "$self_resolved" ]]; then
-        # symlinked invoke:刪 symlink 本身,不刪 repo 內的本體
+    if [[ -L "$0" ]]; then
         rm -f "$0"
-        echo "✓ ear symlink 移除:$0(repo 內 $self_resolved 保留)"
+        echo "✓ ear symlink 移除:$0(本體 $self_resolved 保留)"
+    elif [[ -n "$REPO" && "$self_resolved" == "$REPO"/* ]]; then
+        # 從 repo 內直接執行:那是版控中的原始檔,絕對不能刪
+        echo "○ ear wrapper 是 repo 內原始檔,保留:$self_resolved"
     else
         rm -f "$self_resolved"
         echo "✓ ear wrapper 移除:$self_resolved"

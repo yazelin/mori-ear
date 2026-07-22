@@ -4,7 +4,7 @@ For Claude / agents working in this repo. README.md is the human-facing entry po
 
 ## What this is
 
-A minimal Rust CLI: global hotkey → microphone capture → STT → Groq LLM cleanup → clipboard + Ctrl+V paste-back into the focused window. No GUI, no tray, no persistent state. The "ear" organ in the Mori universe — runs as an independent process so mori-desktop restarts don't kill voice input.
+A minimal Rust CLI: global hotkey → microphone capture → STT → Groq LLM cleanup → clipboard + Ctrl+V paste-back into the focused window. The hotkey has **two sources** that both collapse into one internal `KeyEdge` (`Pressed`/`Released`) before reaching `handle_event`: `global-hotkey` (X11 / Windows) and the `GlobalShortcuts` portal (`src/wayland_hotkey.rs`, Wayland). There is **no toggle mode** — this organ is hold-only; the thing with `ToggleMode` is mori-desktop's `hotkeys.toggle_mode`, don't conflate them. No GUI, no tray, no persistent state. The "ear" organ in the Mori universe — runs as an independent process so mori-desktop restarts don't kill voice input.
 
 STT has two backends (config `backend`, default `auto`): **Groq Whisper API** (cloud, fast) and a **local whisper-server** (the shared `~/.mori/whisper-server.json` discovery contract — see `src/local_stt.rs`). `auto` prefers local whisper-server first (data stays on-device), falls back to Groq on local failure (when a key exists); `groq` / `local` force one. mori-ear is an **Adopter** of the local server: it never *writes or locks* the descriptor (the Starter/Owner — today mori-meeting-recorder's `mori-whisper-serve` supervisor — does that). When the local server is offline, mori-ear may **request an on-demand start** via the contract §11 idempotent entry `~/.mori/bin/mori-whisper-serve --ensure` (it kicks the supervisor, which is the real Starter), then polls ≤15s for ready — see `wake_and_wait` in `src/local_stt.rs`. standalone-first: no supervisor / wake times out → fall back to Groq (`auto`) or error (`local`). Cleanup stays Groq; offline (no key) → STT goes local + cleanup is skipped (raw output).
 
@@ -25,7 +25,8 @@ Every transcription (hotkey, batch, and service paths) runs under a **watchdog**
 manifest.json         — mori-desktop Body Interface manifest (BodyManifest / BI-1, schema_version 1, kind=local_service)
 agentos-manifest.json — AgentOS AppManifest v2 (kind=body-part, provides ear.transcribe as http-service)
 src/
-  main.rs        — entry, config, hotkey thread, paste-back, service wiring, watchdog wrap
+  main.rs        — entry, config, KeyEdge fan-in, hotkey thread, paste-back, service wiring, watchdog wrap
+  wayland_hotkey.rs — GlobalShortcuts portal hotkey (Wayland; Activated/Deactivated → KeyEdge)
   audio.rs       — cpal capture + WAV encode
   stt.rs         — Groq Whisper multipart POST
   cleanup.rs     — Groq LLM繁中 cleanup
@@ -76,6 +77,26 @@ Release builds drop the console subsystem (eliminates the black flash at schedul
 
 `Register-ScheduledTask` / `Unregister-ScheduledTask` under `\` root require admin. The script detects non-elevated invocation and re-launches itself via `Start-Process -Verb RunAs`, passing `-OriginalUser` so the registered principal is the **calling** user (not whatever admin account UAC may pick to run the elevated shell). If you touch this script, preserve the OriginalUser passing — the alternative is registering the task for the wrong account on managed machines.
 
+### Linux Wayland: XGrabKey is silently dead, use the portal
+
+`global-hotkey` grabs via X11. Under GNOME Wayland mori-ear is an XWayland client, and the compositor only routes keys into XWayland **while an X11 window has focus** — the moment focus lands on a Wayland-native window the grab receives nothing. Failure mode is identical to the Windows message-pump bug: `register` succeeds, "ready" logs, hotkey never fires.
+
+`src/wayland_hotkey.rs` binds `org.freedesktop.portal.GlobalShortcuts` instead. Three things there are load-bearing:
+
+1. **`register_host_app` + a `.desktop` file are mandatory.** Without a registered app id GNOME rejects `CreateSession` with `NotAllowed: An app id is required`; without `~/.local/share/applications/<APP_ID>.desktop` the registration itself fails with `App info not found`. mori-desktop hit this first — see its `crates/mori-tauri/src/portal_hotkey.rs`.
+2. **`APP_ID` must differ from mori-desktop's** (`ai.yazelin.mori-ear` vs `ai.yazelin.mori`). Portal permissions are keyed by app id; sharing one would make the two organs overwrite each other's grant.
+3. **`Handle` must be held for the daemon's lifetime.** Dropping the `Session` closes it and the binding dies — same discipline as `_service` in `run()`.
+
+`preferred_trigger` is only a hint: once the user grants permission the compositor owns the binding, so editing `ear.json` `hotkey` afterwards does nothing. That's why `spawn` logs `actual=` — it's the only way a user can tell what's really bound. Reset by deleting `~/.local/share/xdg-desktop-portal/permissions`.
+
+Do NOT run both sources at once. `run()` only starts the X11 bridge when the portal path didn't take, because an XGrabKey registration under Wayland "succeeds" while being permanently dead — two live sources would just make diagnosis harder.
+
+### Linux Wayland: paste-back can't detect the terminal
+
+X11 walks `xdotool getactivewindow` → `/proc/<pid>/comm` to pick Ctrl+V vs Ctrl+Shift+V. Wayland deliberately denies clients any focused-window query (GNOME 45+ closed the Shell `Eval` escape hatch too), so that detection is **impossible** here — hence the `paste_key` config field. Default `ctrl+v`; terminal users must set `ctrl+shift+v` themselves. Don't try to reintroduce auto-detection without a working mechanism.
+
+`paste_back_wayland` uses `wl-copy` + `ydotool` (virtual keyboard via `/dev/uinput`, so Wayland-native windows accept it). It needs `ydotoold` running and the user in the `input` group; on failure it falls back to the X11 path, which still helps hybrid setups (mori-desktop forces `GDK_BACKEND=x11`, so its windows are XWayland).
+
 ### Linux: single-instance + restart timing
 
 X11 `XGrabKey` is per-client. Two mori-ear instances → second silently fails to grab. `single-instance` crate (abstract Unix socket on Linux, named mutex on Windows) ensures one process. `scripts/restart.sh` uses `pkill -9` + a poll loop because the abstract socket needs a beat after process death to be released.
@@ -93,6 +114,10 @@ Order (partial merge):
 3. `GROQ_API_KEY` env var — final fallback
 
 Old behavior was "ear.json wins entirely or nothing" — a user writing a one-line ear.json to override hotkey lost the groq key and the process died. Don't regress this; the partial-merge logic in `Config::load` is small but load-bearing.
+
+### `paste_key` (Wayland only)
+
+`ear.json` `paste_key` (default `ctrl+v`) is the chord `paste_back_wayland` injects. It exists purely because Wayland can't tell us whether the focused window is a terminal (see the gotcha above). X11 / Windows ignore it — they auto-detect. Accepted tokens are in `ydotool_keycodes`; they map to **Linux input event codes**, not ASCII.
 
 ### STT backend selection (`backend`)
 

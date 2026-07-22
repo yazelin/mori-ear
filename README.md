@@ -101,8 +101,11 @@ mkdir -p ~/.local/bin && install -m 755 mori-ear ~/.local/bin/    # 免 sudo
 # 2. 一鍵裝好其餘三層(autostart + GNOME 快捷鍵 + 啟動)
 ./ear.sh install
 
-# 3. (選)把 ear 放進 PATH,之後就能直接打 `ear status` / `ear log`
+# 3. (選)放進 PATH,之後就能直接打 `ear status` / `ear log`
+#    兩支都放 —— ear.sh 會去同目錄找 install-autostart.sh,只放前者的話
+#    日後 `ear autostart on/off` 會找不到腳本
 install -m 755 ear.sh ~/.local/bin/ear
+install -m 755 install-autostart.sh ~/.local/bin/
 ```
 
 `ear.sh` 會自己找 binary(`MORI_EAR_BIN` → `~/.cargo/bin` → `PATH`),所以裝在哪都認得。

@@ -206,6 +206,16 @@ cmd_status() {
     fi
     if autostart_installed; then
         echo "  autostart: ✓ on  ($AUTOSTART_DESKTOP)"
+        # autostart entry 的 Exec= 是安裝當下寫死的路徑。之後換安裝方式
+        # (prebuilt 裝 ~/.local/bin,後來又 cargo install 到 ~/.cargo/bin)
+        # 兩顆 binary 會並存,而開機時跑的仍是舊那顆 —— 沒有任何錯誤訊息,
+        # 只是「改了程式碼、重開機卻沒生效」。這裡主動比對,免得白找半天。
+        local exec_path
+        exec_path=$(sed -n 's/^Exec=//p' "$AUTOSTART_DESKTOP" 2>/dev/null | head -1)
+        if [[ -n "$exec_path" && "$exec_path" != "$BIN" ]]; then
+            echo "             ⚠ autostart 指向 $exec_path,跟現在用的 $BIN 不同"
+            echo "               開機時會跑到前者。修:ear autostart on(重寫路徑)"
+        fi
     else
         echo "  autostart: ✗ off"
     fi

@@ -17,7 +17,10 @@
 //!   - 沒 paste-back(transcript 走 stdout,user 自己 pipe / 抓)
 //!   - 沒 cleanup LLM(原始轉錄就送出)
 //!   - 沒 voice profile / 校正詞庫
-//!   - 沒 Wayland(MVP X11 only)
+//!
+//! 熱鍵有兩條來源,都收斂成同一個 [`KeyEdge`] 餵給 `handle_event`:
+//!   - X11 / Windows:`global-hotkey` crate(見 `spawn_hotkey_thread`)
+//!   - Wayland:`GlobalShortcuts` portal(見 `wayland_hotkey`)
 //!
 //! 這是「身體 + 器官」拆分的第一個器官 — mori-desktop 重啟它不重啟,
 //! user 永遠有路講話。
@@ -43,8 +46,30 @@ mod service;
 mod stt;
 mod stt_prompt;
 mod watchdog;
+#[cfg(target_os = "linux")]
+mod wayland_hotkey;
 
 const DEFAULT_HOTKEY: &str = "Ctrl+Alt+E";
+
+/// 熱鍵的一次邊緣事件 —— 這顆器官只有 hold 語意:按下開錄、放開停錄。
+///
+/// 存在的理由是**解耦事件來源**:X11/Windows 走 `global-hotkey` 的
+/// [`HotKeyState`],Wayland 走 portal 的 Activated/Deactivated,兩邊收斂成
+/// 同一個型別餵給 [`handle_event`],錄音邏輯就不必知道自己跑在哪個顯示協定上。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyEdge {
+    Pressed,
+    Released,
+}
+
+impl From<HotKeyState> for KeyEdge {
+    fn from(s: HotKeyState) -> Self {
+        match s {
+            HotKeyState::Pressed => KeyEdge::Pressed,
+            HotKeyState::Released => KeyEdge::Released,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -75,6 +100,14 @@ struct Config {
     /// 設 false → 只印 stdout,不碰 clipboard、不按 Ctrl+V — pipe 用法 / headless 場景適用。
     #[serde(default = "default_paste_back")]
     paste_back: bool,
+    /// 貼上時送的按鍵組合(預設 `ctrl+v`)。**只有 Wayland 需要設**。
+    ///
+    /// X11 / Windows 會用 `xdotool getactivewindow` / `GetForegroundWindow` 偵測
+    /// 焦點視窗的 process name 自動決定要不要加 Shift(terminal 要 Ctrl+Shift+V),
+    /// 這個欄位對它們沒作用。Wayland 刻意不讓 client 查焦點視窗,偵測不了,
+    /// 所以主要在 terminal 打字的人要自己設 `"paste_key": "ctrl+shift+v"`。
+    #[serde(default = "default_paste_key")]
+    paste_key: String,
     /// STT backend:`auto`(預設,Groq 優先、失敗/無 key → 本地 whisper-server)
     /// / `groq`(只 Groq)/ `local`(只本地 whisper-server,隱私、不碰 Groq)。
     #[serde(default = "default_backend")]
@@ -171,6 +204,25 @@ fn default_paste_back() -> bool {
     true
 }
 
+/// Wayland paste-back 的預設按鍵。`ctrl+v` 對絕大多數 GUI app 正確;
+/// terminal 需要 `ctrl+shift+v`,但 Wayland 偵測不到焦點視窗,只能讓使用者自己設。
+fn default_paste_key() -> String {
+    "ctrl+v".to_string()
+}
+
+/// 設定裡的 `paste_key`,給 paste-back 路徑讀。
+///
+/// 用 `OnceLock` 而非一路傳參數:它是啟動時讀一次就不變的值,而
+/// `handle_event` 的參數已經多到掛 `#[allow(clippy::too_many_arguments)]`,
+/// 再加一個純設定值只會讓簽章更難讀。
+#[cfg(target_os = "linux")]
+static PASTE_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn paste_key() -> &'static str {
+    PASTE_KEY.get().map(String::as_str).unwrap_or("ctrl+v")
+}
+
 fn default_backend() -> String {
     "auto".into()
 }
@@ -196,6 +248,7 @@ impl Config {
             cleanup_prompt_file: String::new(),
             stt_initial_prompt_file: String::new(),
             paste_back: true,
+            paste_key: default_paste_key(),
             backend: default_backend(),
             voice_input: VoiceInputConfig::default(),
             transcribe_timeout_secs: default_transcribe_timeout_secs(),
@@ -522,6 +575,9 @@ pub(crate) async fn transcribe_with_fallback(
 /// 不裝 single-instance / 不裝 hotkey / 不 paste-back — 純 pipeline 工具。
 async fn batch(input_path: &str) -> Result<ExitCode> {
     let cfg = Config::load();
+    // paste-back 路徑不經過 handle_event 的參數鏈,從這裡拿(見 PASTE_KEY 註解)。
+    #[cfg(target_os = "linux")]
+    let _ = PASTE_KEY.set(cfg.paste_key.clone());
     let api_key = cfg.resolved_api_key();
     if cfg.backend == "groq" && api_key.is_none() {
         anyhow::bail!("backend=groq 但無 Groq API key — 設 GROQ_API_KEY / config.json,或把 backend 設成 auto/local");
@@ -632,24 +688,78 @@ async fn run() -> Result<ExitCode> {
     }
 
     let cfg = Config::load();
+    // paste-back 路徑不經過 handle_event 的參數鏈,從這裡拿(見 PASTE_KEY 註解)。
+    #[cfg(target_os = "linux")]
+    let _ = PASTE_KEY.set(cfg.paste_key.clone());
     let api_key = cfg.resolved_api_key();
     if cfg.backend == "groq" && api_key.is_none() {
         anyhow::bail!(
             "backend=groq 但無 Groq API key — 設 GROQ_API_KEY / 寫進 ~/.mori/config.json 的 providers.groq.api_key,或把 backend 設成 auto/local"
         );
     }
-    let hotkey =
-        parse_hotkey(&cfg.hotkey).with_context(|| format!("parse hotkey: {}", cfg.hotkey))?;
-
     info!(hotkey = %cfg.hotkey, backend = %cfg.backend, "mori-ear ready — 按住熱鍵說話、放開停止");
 
-    // global-hotkey 0.6 在 Windows 上把 RegisterHotKey 綁到 hidden window,WM_HOTKEY
-    // 進 thread queue 後**需要那條 thread 自己 pump message** WindowProc 才會被呼叫。
-    // tokio runtime 的 worker thread 不 pump Win32 message;直接在 main 建 manager
-    // 會 register 成功但 event 永遠收不到。
-    // 解法:Windows 上專開一條 OS thread 建 manager + register + 跑 GetMessage loop。
-    // Linux X11 crate 自己 spawn event thread,不受影響,維持原本 main thread 路徑即可。
-    spawn_hotkey_thread(hotkey, cfg.hotkey.clone())?;
+    // 熱鍵事件的統一入口 —— 不管來源是 X11/Windows 的 global-hotkey 還是 Wayland
+    // 的 portal,最後都變成 KeyEdge 從這條 channel 出來。
+    let (edge_tx, mut edge_rx) = tokio::sync::mpsc::unbounded_channel::<KeyEdge>();
+
+    // Wayland:先試 portal。成功就完全不碰 X11 —— XGrabKey 在 Wayland 下註冊會
+    // 「成功」但永遠收不到事件,兩條並行只會製造混淆。
+    // `_portal` 要 hold 到 run() 結束:drop 掉 session,綁定就沒了。
+    #[cfg(target_os = "linux")]
+    let _portal = if wayland_hotkey::is_wayland() {
+        match wayland_hotkey::spawn(&cfg.hotkey, edge_tx.clone()).await {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!(
+                    error = ?e,
+                    "Wayland portal 熱鍵註冊失敗 —— fallback 回 X11(XGrabKey)。\
+                     這條路只有在焦點停在 X11 / XWayland 視窗時才收得到按鍵"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let use_x11_hotkey = _portal.is_none();
+    #[cfg(not(target_os = "linux"))]
+    let use_x11_hotkey = true;
+
+    if use_x11_hotkey {
+        let hotkey =
+            parse_hotkey(&cfg.hotkey).with_context(|| format!("parse hotkey: {}", cfg.hotkey))?;
+        // global-hotkey 0.6 在 Windows 上把 RegisterHotKey 綁到 hidden window,WM_HOTKEY
+        // 進 thread queue 後**需要那條 thread 自己 pump message** WindowProc 才會被呼叫。
+        // tokio runtime 的 worker thread 不 pump Win32 message;直接在 main 建 manager
+        // 會 register 成功但 event 永遠收不到。
+        // 解法:Windows 上專開一條 OS thread 建 manager + register + 跑 GetMessage loop。
+        // Linux X11 crate 自己 spawn event thread,不受影響,維持原本 main thread 路徑即可。
+        spawn_hotkey_thread(hotkey, cfg.hotkey.clone())?;
+
+        // global-hotkey 的 receiver 是同步 crossbeam channel,沒有 async 介面。
+        // 拿一條 blocking thread 把它抽乾、轉成 KeyEdge 推進統一 channel,
+        // 主 loop 就只要 await 一個來源。50ms 的 poll 間隔沿用原本的節奏
+        // (熱鍵是人手速度,這個延遲感覺不出來)。
+        let tx = edge_tx.clone();
+        std::thread::Builder::new()
+            .name("mori-ear-hotkey-bridge".into())
+            .spawn(move || {
+                let rx = GlobalHotKeyEvent::receiver();
+                loop {
+                    while let Ok(ev) = rx.try_recv() {
+                        if tx.send(KeyEdge::from(ev.state)).is_err() {
+                            return; // 主 loop 收工了
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+            .context("spawn hotkey bridge thread")?;
+    }
+    // 本地 tx 留著沒用會讓 edge_rx 永遠不 close,drop 掉。
+    drop(edge_tx);
 
     // 共用狀態:目前是不是錄音中。audio::Recorder handle 也存這
     let recorder = Arc::new(Mutex::new(None::<audio::Recorder>));
@@ -658,7 +768,6 @@ async fn run() -> Result<ExitCode> {
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
-    let rx = GlobalHotKeyEvent::receiver();
     let api_key_arc = Arc::new(api_key); // Arc<Option<String>>:無 key 時走本地 backend
     let lang_arc = Arc::new(cfg.language.clone());
     let raw_arc = Arc::new(cfg.raw);
@@ -703,23 +812,26 @@ async fn run() -> Result<ExitCode> {
                 info!("收到 Ctrl+C,退出");
                 return Ok(ExitCode::SUCCESS);
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                // poll hotkey channel
-                while let Ok(ev) = rx.try_recv() {
-                    handle_event(
-                        ev,
-                        recorder.clone(),
-                        api_key_arc.clone(),
-                        lang_arc.clone(),
-                        raw_arc.clone(),
-                        prompt_file_arc.clone(),
-                        stt_initial_prompt_file_arc.clone(),
-                        paste_back_arc.clone(),
-                        backend_arc.clone(),
-                        trim_cfg,
-                        transcribe_timeout,
-                    ).await;
-                }
+            edge = edge_rx.recv() => {
+                let Some(edge) = edge else {
+                    // 所有 sender 都沒了 —— portal stream 斷線且 X11 bridge 也收工。
+                    // 沒有熱鍵來源就沒有存在意義,退出讓 autostart / supervisor 重拉。
+                    error!("熱鍵來源全部中斷,退出");
+                    return Ok(ExitCode::FAILURE);
+                };
+                handle_event(
+                    edge,
+                    recorder.clone(),
+                    api_key_arc.clone(),
+                    lang_arc.clone(),
+                    raw_arc.clone(),
+                    prompt_file_arc.clone(),
+                    stt_initial_prompt_file_arc.clone(),
+                    paste_back_arc.clone(),
+                    backend_arc.clone(),
+                    trim_cfg,
+                    transcribe_timeout,
+                ).await;
             }
         }
     }
@@ -738,6 +850,17 @@ fn paste_back(text: &str) -> anyhow::Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        // Wayland 下 xclip/xdotool 只對 XWayland 視窗有效,得換 wl-copy + ydotool。
+        // 兩條都失敗才回錯 —— XWayland fallback 對「GUI 是 X11、compositor 是
+        // Wayland」的混合環境仍然有用(mori-desktop 就是那種:強制 GDK_BACKEND=x11)。
+        if wayland_hotkey::is_wayland() {
+            match paste_back_wayland(text, paste_key()) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(error = ?e, "Wayland paste-back 失敗,試 XWayland(xclip/xdotool)");
+                }
+            }
+        }
         paste_back_linux_clipboard(text)
     }
     #[cfg(target_os = "windows")]
@@ -780,6 +903,100 @@ pub(crate) fn pre_exec_close_fds(cmd: &mut std::process::Command) -> &mut std::p
         });
     }
     cmd
+}
+
+/// Wayland 的 paste-back:`wl-copy` 寫 clipboard + `ydotool` 注入 Ctrl+V。
+///
+/// 為什麼不能沿用 X11 那條:`xclip` 寫的是 X11 selection、`xdotool` 走 XTEST,
+/// 兩者在 Wayland 下**只對 XWayland 視窗有效**。Wayland-native 視窗看不到那份
+/// clipboard,也收不到那個按鍵注入。
+///
+/// `ydotool` 走 `/dev/uinput` 造一顆虛擬鍵盤,對 compositor 來說跟實體鍵盤沒兩樣,
+/// 所以任何視窗都吃 —— 代價是需要 `ydotoold` 在跑、使用者在 `input` 群組。
+///
+/// # 已知限制:偵測不到焦點視窗
+///
+/// X11 那條靠 `xdotool getactivewindow` 判斷該送 Ctrl+V 還是 Ctrl+Shift+V。
+/// Wayland 刻意不給 client 查詢焦點視窗(GNOME 45+ 連 Shell Eval 也封了),
+/// 所以這裡**無法自動偵測 terminal**。預設送 Ctrl+V;terminal 使用者要在
+/// `~/.mori/ear.json` 設 `"paste_key": "ctrl+shift+v"`。
+#[cfg(target_os = "linux")]
+fn paste_back_wayland(text: &str, paste_key: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    // 1. wl-copy 寫 Wayland clipboard
+    let mut copy_cmd = Command::new("wl-copy");
+    copy_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = pre_exec_close_fds(&mut copy_cmd)
+        .spawn()
+        .context("spawn wl-copy — 沒裝?`sudo apt install wl-clipboard ydotool`")?;
+    {
+        let stdin = child.stdin.as_mut().context("get wl-copy stdin")?;
+        stdin
+            .write_all(text.as_bytes())
+            .context("write to wl-copy")?;
+    }
+    // wl-copy 跟 xclip 一樣 fork 成 daemon 守著 selection,不 wait(會卡)。
+    drop(child);
+
+    std::thread::sleep(std::time::Duration::from_millis(60));
+
+    // 2. ydotool 注入按鍵。它要 ydotoold 的 socket;env 沒設就用預設路徑,
+    //    免得 autostart 環境(沒有 shell rc)找不到。
+    let combo =
+        ydotool_keycodes(paste_key).with_context(|| format!("認不得的 paste_key: {paste_key}"))?;
+    let mut yd = Command::new("ydotool");
+    yd.arg("key").args(&combo);
+    if std::env::var_os("YDOTOOL_SOCKET").is_none() {
+        yd.env(
+            "YDOTOOL_SOCKET",
+            format!("/run/user/{}/.ydotool_socket", unsafe { libc::getuid() }),
+        );
+    }
+    let status = pre_exec_close_fds(&mut yd).status().context(
+        "spawn ydotool — 沒裝?`sudo apt install ydotool` 且 `systemctl --user enable --now ydotool`",
+    )?;
+    if !status.success() {
+        anyhow::bail!(
+            "ydotool key {paste_key} 失敗({status})—— ydotoold 沒跑?\
+             或使用者不在 input 群組(`sudo usermod -aG input $USER` 後重登)"
+        );
+    }
+
+    tracing::info!(paste_key, "paste-back via wl-copy + ydotool (Wayland)");
+    Ok(())
+}
+
+/// 把 `ctrl+shift+v` 轉成 ydotool 的 `<keycode>:<1按下|0放開>` 序列。
+///
+/// 用的是 Linux input event code(`linux/input-event-codes.h`),不是 ASCII ——
+/// 兩者不一樣,別用字元值去算。
+#[cfg(target_os = "linux")]
+fn ydotool_keycodes(combo: &str) -> Option<Vec<String>> {
+    let mut down = Vec::new();
+    let mut up = Vec::new();
+    for part in combo.split('+') {
+        let code = match part.trim().to_lowercase().as_str() {
+            "ctrl" | "control" => 29, // KEY_LEFTCTRL
+            "shift" => 42,            // KEY_LEFTSHIFT
+            "alt" => 56,              // KEY_LEFTALT
+            "super" | "meta" => 125,  // KEY_LEFTMETA
+            "v" => 47,                // KEY_V
+            "insert" => 110,          // KEY_INSERT
+            _ => return None,
+        };
+        down.push(format!("{code}:1"));
+        up.insert(0, format!("{code}:0")); // 反序放開,跟真人按鍵一致
+    }
+    if down.is_empty() {
+        return None;
+    }
+    down.extend(up);
+    Some(down)
 }
 
 #[cfg(target_os = "linux")]
@@ -1060,7 +1277,7 @@ fn needs_shift_for_paste_windows(process_name: &str) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_event(
-    ev: GlobalHotKeyEvent,
+    edge: KeyEdge,
     recorder: Arc<Mutex<Option<audio::Recorder>>>,
     api_key: Arc<Option<String>>,
     language: Arc<String>,
@@ -1072,8 +1289,8 @@ async fn handle_event(
     trim: audio::TrimConfig,
     timeout: Duration,
 ) {
-    match ev.state {
-        HotKeyState::Pressed => {
+    match edge {
+        KeyEdge::Pressed => {
             let mut slot = recorder.lock();
             if slot.is_some() {
                 warn!("hotkey press 但已在錄音中,忽略");
@@ -1087,7 +1304,7 @@ async fn handle_event(
                 Err(e) => error!(error = ?e, "錄音啟動失敗"),
             }
         }
-        HotKeyState::Released => {
+        KeyEdge::Released => {
             let r = recorder.lock().take();
             let Some(r) = r else {
                 return;

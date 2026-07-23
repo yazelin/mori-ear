@@ -269,6 +269,26 @@ fn supervisor_program() -> std::path::PathBuf {
 /// Linux 關繼承 fd(別讓這個短命 shim 帶走 mori-ear 的 single-instance socket;見 pre_exec_close_fds)。
 async fn request_wake() -> Result<()> {
     let program = supervisor_program();
+
+    // 先確認檔案在,別直接 spawn —— 這不是防禦性檢查,是繞開一個會誤導人的假象。
+    //
+    // `pre_exec_close_fds` 在 fork 後的子行程裡關掉所有 fd >= 3。Rust std 剛好
+    // 是用一支 CLOEXEC pipe 把 exec 失敗的 errno 回報給父行程,那支 pipe 的 fd
+    // 也 >= 3,被我們一起關掉了。於是 exec 失敗(ENOENT)時子行程寫不回 errno,
+    // std 的 rtassert! 直接 abort() —— 父行程看到的是
+    // 「退出碼 signal: 6 (SIGABRT) (core dumped)」。
+    //
+    // 也就是說:單純的「沒裝 supervisor」會被報成 core dump,看起來像 supervisor
+    // 自己爆了。實際上 mori-meeting-recorder 根本沒裝在這台機器上。
+    // 先檢查存在就能把絕大多數情況變回誠實的訊息。
+    if !program.is_file() {
+        anyhow::bail!(
+            "沒裝 supervisor —— 找不到 {}(它屬於 mori-meeting-recorder;\
+             沒裝的話 backend=auto 會正常 fallback Groq,不影響使用)",
+            program.display()
+        );
+    }
+
     let status = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(&program);
         cmd.arg("--ensure")

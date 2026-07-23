@@ -104,6 +104,14 @@ The binary can install cleanly, autostart fine, and the hotkey can fire — and 
 
 Missing deps are deliberately **non-fatal** to `ear install` — stdout still carries the transcript, so the daemon is useful without paste-back. If you add a new external command to any paste-back path, add it to `check_deps` in the matching session branch, or it becomes another silent failure.
 
+### Linux: `pre_exec_close_fds` masks exec failures as SIGABRT
+
+The hook closes every fd >= 3 in the forked child. Rust std reports exec failure to the parent through a CLOEXEC pipe whose fd is also >= 3 — so the hook closes it too. When `exec` then fails (typically ENOENT), the child cannot write the errno back, `rtassert!` fires, and the process `abort()`s. The parent sees `signal: 6 (SIGABRT) (core dumped)` for what is really "file not found".
+
+This burned us with `mori-whisper-serve --ensure`: a machine that simply doesn't have mori-meeting-recorder installed produced a core-dump message on every single transcription, which reads like the supervisor crashed. `request_wake` now checks `program.is_file()` before spawning, so the common case reports honestly (and skips a doomed fork/exec).
+
+Any *new* spawn that goes through `pre_exec_close_fds` inherits this trap. Check the binary exists first, or expect a misleading SIGABRT.
+
 ### Linux: single-instance + restart timing
 
 X11 `XGrabKey` is per-client. Two mori-ear instances → second silently fails to grab. `single-instance` crate (abstract Unix socket on Linux, named mutex on Windows) ensures one process. `scripts/restart.sh` uses `pkill -9` + a poll loop because the abstract socket needs a beat after process death to be released.

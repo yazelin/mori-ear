@@ -166,6 +166,31 @@ struct VoiceInputConfig {
     /// 線性振幅門檻(預設 0.02 ≈ -34 dBFS,對齊 mori-desktop)。
     #[serde(default = "default_trim_threshold")]
     trim_silence_threshold: f32,
+    /// 講到一半的停頓就把前段先轉譯掉(預設 true),放開時只剩尾巴要等。
+    ///
+    /// 貼上仍然是放開之後一次貼完 —— 按住熱鍵時 X11 有鍵盤 grab,
+    /// 這時候注入的 Ctrl+V 送不到焦點視窗(實測會整段消失),所以不能邊講邊貼。
+    /// 關掉 = 舊行為:放開才整段送、整句 cleanup。
+    #[serde(default = "default_stream_enabled")]
+    stream_chunks_enabled: bool,
+    /// 尾巴連續這麼多毫秒低於門檻就算一個停頓、可以切段(預設 700)。
+    #[serde(default = "default_stream_pause_ms")]
+    stream_pause_ms: u32,
+    /// 一段至少要累積這麼久才准切(預設 1500),避免切出碎片害 Whisper 認不準。
+    #[serde(default = "default_stream_min_segment_ms")]
+    stream_min_segment_ms: u32,
+}
+
+fn default_stream_enabled() -> bool {
+    true
+}
+
+fn default_stream_pause_ms() -> u32 {
+    700
+}
+
+fn default_stream_min_segment_ms() -> u32 {
+    1500
 }
 
 fn default_trim_enabled() -> bool {
@@ -186,11 +211,33 @@ impl Default for VoiceInputConfig {
             trim_silence_enabled: default_trim_enabled(),
             trim_silence_min_ms: default_trim_min_ms(),
             trim_silence_threshold: default_trim_threshold(),
+            stream_chunks_enabled: default_stream_enabled(),
+            stream_pause_ms: default_stream_pause_ms(),
+            stream_min_segment_ms: default_stream_min_segment_ms(),
         }
     }
 }
 
+/// 「講到一半就先送」的參數,由 `VoiceInputConfig` 攤平出來。
+#[derive(Clone, Copy, Debug)]
+struct StreamConfig {
+    enabled: bool,
+    pause_ms: u32,
+    min_segment_ms: u32,
+    /// 判定停頓的振幅門檻,跟剪裁共用一個值(語意一樣:多小算沒在講話)。
+    threshold: f32,
+}
+
 impl VoiceInputConfig {
+    fn to_stream(&self) -> StreamConfig {
+        StreamConfig {
+            enabled: self.stream_chunks_enabled,
+            pause_ms: self.stream_pause_ms,
+            min_segment_ms: self.stream_min_segment_ms,
+            threshold: self.trim_silence_threshold,
+        }
+    }
+
     fn to_trim(&self) -> audio::TrimConfig {
         audio::TrimConfig {
             enabled: self.trim_silence_enabled,
@@ -776,7 +823,30 @@ async fn run() -> Result<ExitCode> {
     let paste_back_arc = Arc::new(cfg.paste_back);
     let backend_arc = Arc::new(cfg.backend.clone());
     let trim_cfg = cfg.voice_input.to_trim(); // Copy,每輪傳值即可
+    let stream_cfg = cfg.voice_input.to_stream();
+    if stream_cfg.enabled {
+        info!(
+            pause_ms = stream_cfg.pause_ms,
+            min_segment_ms = stream_cfg.min_segment_ms,
+            "講到一半的停頓就先把前段轉譯掉,放開時只等尾巴(voice_input.stream_chunks_enabled)"
+        );
+    }
+
     let transcribe_timeout = Duration::from_secs(cfg.transcribe_timeout_secs);
+    let pipeline = Pipeline {
+        api_key: api_key_arc.clone(),
+        language: lang_arc.clone(),
+        skip_cleanup: raw_arc.clone(),
+        cleanup_prompt_file: prompt_file_arc.clone(),
+        stt_initial_prompt_file: stt_initial_prompt_file_arc.clone(),
+        paste_back_enabled: paste_back_arc.clone(),
+        backend: backend_arc.clone(),
+        timeout: transcribe_timeout,
+    };
+    // 停頓切出去的各段任務(按順序)+ 背景切段器的把手
+    let segments: Arc<Mutex<Vec<tokio::task::JoinHandle<Option<String>>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let chunker_slot: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
     // 對外轉譯服務 —— 讓 AgentOS(http-service skill)/ mori-desktop 當 client 消費 ear 的轉錄。
     // `_service` 綁進 daemon 生命週期(drop = unblock server + 刪 mori-ear-server.json descriptor)。
@@ -822,15 +892,11 @@ async fn run() -> Result<ExitCode> {
                 handle_event(
                     edge,
                     recorder.clone(),
-                    api_key_arc.clone(),
-                    lang_arc.clone(),
-                    raw_arc.clone(),
-                    prompt_file_arc.clone(),
-                    stt_initial_prompt_file_arc.clone(),
-                    paste_back_arc.clone(),
-                    backend_arc.clone(),
+                    pipeline.clone(),
                     trim_cfg,
-                    transcribe_timeout,
+                    stream_cfg,
+                    segments.clone(),
+                    chunker_slot.clone(),
                 ).await;
             }
         }
@@ -1275,10 +1341,16 @@ fn needs_shift_for_paste_windows(process_name: &str) -> bool {
     .any(|t| p.contains(t))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_event(
-    edge: KeyEdge,
-    recorder: Arc<Mutex<Option<audio::Recorder>>>,
+/// 太短 / 太安靜的錄音 Whisper 會幻覺出「謝謝」「請訂閱」,整段跳過。
+/// 分段與尾巴共用同一組守門值。
+const MIN_DURATION: f32 = 0.25; // 0.25s 以下視為熱鍵誤觸(快按下又放開,沒實際說話)
+                                // 註:單音節中文「好 / 對 / 是」一般 0.25~0.35s
+                                //     講太快被擋的話再下調 0.18
+const MIN_RMS_DB: f32 = -45.0; // -45 dB 以下視為靜音(背景噪音通常 -50 ~ -55 dB)
+
+/// 一段語音走完全程需要的東西。每段一份 clone,參數列才不會爆炸。
+#[derive(Clone)]
+struct Pipeline {
     api_key: Arc<Option<String>>,
     language: Arc<String>,
     skip_cleanup: Arc<bool>,
@@ -1286,8 +1358,119 @@ async fn handle_event(
     stt_initial_prompt_file: Arc<String>,
     paste_back_enabled: Arc<bool>,
     backend: Arc<String>,
-    trim: audio::TrimConfig,
     timeout: Duration,
+}
+
+impl Pipeline {
+    async fn transcribe_and_clean(
+        &self,
+        label: &str,
+        wav: Vec<u8>,
+        duration_secs: f32,
+        rms_db: f32,
+    ) -> Option<String> {
+        if wav.is_empty() || duration_secs < MIN_DURATION || rms_db < MIN_RMS_DB {
+            info!(
+                label,
+                duration_secs, rms_db, "這段太短或太安靜,skip STT(避免 Whisper 幻覺「謝謝」之類)"
+            );
+            return None;
+        }
+        let t0 = std::time::Instant::now();
+        let (backend, api_key, language, prompt_file) = (
+            self.backend.clone(),
+            self.api_key.clone(),
+            self.language.clone(),
+            self.stt_initial_prompt_file.clone(),
+        );
+        let raw = match watchdog::guard(self.timeout, label, async move {
+            let initial_prompt = stt_prompt::resolve(None, &prompt_file);
+            transcribe_with_fallback(
+                &backend,
+                api_key.as_deref(),
+                &language,
+                initial_prompt.as_deref(),
+                wav,
+            )
+            .await
+        })
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                error!(label, error = ?e, "轉譯失敗或逾時,放棄這段");
+                return None;
+            }
+        };
+        let stt_ms = t0.elapsed().as_millis() as u64;
+        if raw.trim().is_empty() {
+            info!(label, stt_ms, "這段沒轉出內容");
+            return None;
+        }
+
+        // LLM cleanup(繁中校正 + 標點 + 簡轉繁)。需 Groq key;skip_cleanup 或無 key
+        // (離線)→ 直接用 raw。cleanup 失敗也 fallback raw。
+        //
+        // 分段之後 cleanup 變成逐段做:接縫處的標點會比整句做差一點,換到的是
+        // 「講話當下就看得到字」。要回到整句 cleanup 就關 stream_chunks_enabled。
+        let t1 = std::time::Instant::now();
+        let text = if *self.skip_cleanup {
+            raw
+        } else if let Some(key) = self.api_key.as_deref() {
+            let prompt = cleanup::resolve_system_prompt(&self.cleanup_prompt_file);
+            match cleanup::cleanup(key, &raw, &prompt).await {
+                Ok(cleaned) => cleaned,
+                Err(e) => {
+                    warn!(label, error = ?e, "cleanup 失敗,用 raw whisper output");
+                    raw
+                }
+            }
+        } else {
+            info!(label, "無 Groq key,跳過 cleanup,用 raw whisper output");
+            raw
+        };
+        info!(
+            label,
+            duration_secs,
+            stt_ms,
+            cleanup_ms = t1.elapsed().as_millis() as u64,
+            chars = text.chars().count(),
+            "✓ 這段完成"
+        );
+        Some(text)
+    }
+}
+
+/// 輸出一段文字:stdout 永遠印(pipe 用法靠這),paste-back 可選。
+fn emit(text: &str, paste_back_enabled: bool) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{}", text);
+    let _ = out.flush();
+    drop(out);
+
+    if !paste_back_enabled {
+        info!(chars = text.chars().count(), "✓ 轉錄完成(paste_back=false,只印 stdout)");
+        return;
+    }
+    match paste_back(text) {
+        Ok(()) => info!(chars = text.chars().count(), "✓ 轉錄 + 貼回完成"),
+        Err(e) => {
+            warn!(error = ?e, "貼回失敗(stdout 還是有印,可自己抓)");
+            info!(chars = text.chars().count(), "✓ 轉錄完成");
+        }
+    }
+}
+
+async fn handle_event(
+    edge: KeyEdge,
+    recorder: Arc<Mutex<Option<audio::Recorder>>>,
+    pipeline: Pipeline,
+    trim: audio::TrimConfig,
+    stream: StreamConfig,
+    // 停頓切出去的各段任務,按講話順序;放開時收回來接成一句
+    segments: Arc<Mutex<Vec<tokio::task::JoinHandle<Option<String>>>>>,
+    chunker_slot: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 ) {
     match edge {
         KeyEdge::Pressed => {
@@ -1299,108 +1482,91 @@ async fn handle_event(
             match audio::Recorder::start() {
                 Ok(r) => {
                     info!("🎤 開始錄音");
+                    segments.lock().clear();
+                    if stream.enabled {
+                        let buf = r.buffer();
+                        let (pipe, segs) = (pipeline.clone(), segments.clone());
+                        let chunker = tokio::spawn(async move {
+                            let mut n = 0usize;
+                            loop {
+                                tokio::time::sleep(Duration::from_millis(150)).await;
+                                if buf.secs_buffered() * 1000.0 < stream.min_segment_ms as f32 {
+                                    continue;
+                                }
+                                if !buf.tail_is_silent(stream.pause_ms, stream.threshold) {
+                                    continue;
+                                }
+                                let Some((wav, dur, rms)) = buf.take_wav(&trim) else {
+                                    continue;
+                                };
+                                n += 1;
+                                let label = format!("seg{n}");
+                                info!(label = %label, duration_secs = dur, "偵測到停頓,前段先送出");
+                                let p = pipe.clone();
+                                let task = tokio::spawn(async move {
+                                    p.transcribe_and_clean(&label, wav, dur, rms).await
+                                });
+                                segs.lock().push(task);
+                            }
+                        });
+                        *chunker_slot.lock() = Some(chunker);
+                    }
                     *slot = Some(r);
                 }
                 Err(e) => error!(error = ?e, "錄音啟動失敗"),
             }
         }
         KeyEdge::Released => {
+            // 先停切段器,免得它跟這裡搶同一份 buffer
+            if let Some(h) = chunker_slot.lock().take() {
+                h.abort();
+            }
             let r = recorder.lock().take();
             let Some(r) = r else {
                 return;
             };
-            let (wav, duration_secs, rms_db) = match r.stop_and_encode_wav(trim) {
-                Ok(w) => w,
-                Err(e) => {
-                    error!(error = ?e, "WAV 編碼失敗");
+            let done: Vec<_> = std::mem::take(&mut *segments.lock());
+            // 尾巴可能剛被切段器取走 → 0 samples,那不是錯誤,交給守門判
+            let (wav, duration_secs, rms_db) = r
+                .stop_and_encode_wav(trim)
+                .unwrap_or_else(|_| (Vec::new(), 0.0, -90.0));
+            info!(
+                bytes = wav.len(),
+                duration_secs,
+                rms_db,
+                earlier_segments = done.len(),
+                "錄音停止,尾巴送出"
+            );
+            let t_release = std::time::Instant::now();
+            tokio::spawn(async move {
+                // 尾巴自己轉;先前各段多半在你講話的時候就跑完了,這裡只是收回來
+                let tail = pipeline
+                    .transcribe_and_clean("tail", wav, duration_secs, rms_db)
+                    .await;
+                let mut parts: Vec<String> = Vec::with_capacity(done.len() + 1);
+                for task in done {
+                    match task.await {
+                        Ok(Some(t)) if !t.trim().is_empty() => parts.push(t.trim().to_string()),
+                        Ok(_) => {}
+                        Err(e) => warn!(error = ?e, "某一段的任務沒收回來,略過"),
+                    }
+                }
+                if let Some(t) = tail {
+                    if !t.trim().is_empty() {
+                        parts.push(t.trim().to_string());
+                    }
+                }
+                if parts.is_empty() {
+                    info!("所有分段都沒轉出內容,不貼回");
                     return;
                 }
-            };
-            // 安靜 / 太短的 audio Whisper 會幻覺出「謝謝」「請訂閱」等,直接 skip
-            const MIN_DURATION: f32 = 0.25; // 0.25s 以下視為熱鍵誤觸(快按下又放開,沒實際說話)
-                                            // 註:單音節中文「好 / 對 / 是」一般 0.25~0.35s
-                                            //     講太快被擋的話再下調 0.18
-            const MIN_RMS_DB: f32 = -45.0; // -45 dB 以下視為靜音(背景噪音通常 -50 ~ -55 dB)
-            if duration_secs < MIN_DURATION || rms_db < MIN_RMS_DB {
+                let segments_done = parts.len();
+                emit(&parts.join(""), *pipeline.paste_back_enabled);
                 info!(
-                    duration_secs,
-                    rms_db, "錄音太短或太安靜,skip STT(避免 Whisper 幻覺「謝謝」之類)"
+                    segments = segments_done,
+                    total_after_release_ms = t_release.elapsed().as_millis() as u64,
+                    "放開之後總共等了這麼久"
                 );
-                return;
-            }
-            info!(bytes = wav.len(), duration_secs, rms_db, "錄音停止,送 STT");
-            // STT 在 spawn 跑,主 loop 不卡
-            tokio::spawn(async move {
-                // STT(+cleanup)整段包進看門狗:逾時(transcribe_timeout_secs,預設 90s)就
-                // 放棄這句、不讓一輪卡住的轉譯把 daemon 拖住。
-                let text = match watchdog::guard(timeout, "hotkey:STT", async move {
-                    let initial_prompt = stt_prompt::resolve(None, &stt_initial_prompt_file);
-                    let raw = transcribe_with_fallback(
-                        &backend,
-                        api_key.as_deref(),
-                        &language,
-                        initial_prompt.as_deref(),
-                        wav,
-                    )
-                    .await?;
-
-                    // Step 2:LLM cleanup(繁中校正 + 標點 + 簡轉繁)。需 Groq key;
-                    // skip_cleanup 或無 key(離線)→ 直接用 raw。cleanup 失敗也 fallback raw。
-                    let text = if *skip_cleanup {
-                        raw
-                    } else if let Some(key) = api_key.as_deref() {
-                        let prompt = cleanup::resolve_system_prompt(&cleanup_prompt_file);
-                        match cleanup::cleanup(key, &raw, &prompt).await {
-                            Ok(cleaned) => {
-                                info!(
-                                    raw_chars = raw.chars().count(),
-                                    clean_chars = cleaned.chars().count(),
-                                    "✓ cleanup OK"
-                                );
-                                cleaned
-                            }
-                            Err(e) => {
-                                warn!(error = ?e, "cleanup 失敗,用 raw whisper output");
-                                raw
-                            }
-                        }
-                    } else {
-                        info!("無 Groq key,跳過 cleanup,用 raw whisper output");
-                        raw
-                    };
-                    Ok::<String, anyhow::Error>(text)
-                })
-                .await
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        error!(error = ?e, "轉譯失敗或逾時,放棄這句(STT/cleanup 不行或超時)");
-                        return;
-                    }
-                };
-
-                // (a) stdout 永遠印 — pipe 用法 / `mori-ear > log.txt` 都靠這
-                use std::io::Write as _;
-                let mut out = std::io::stdout().lock();
-                let _ = writeln!(out, "{}", text);
-                let _ = out.flush();
-                drop(out);
-
-                // (b) paste-back 可選 — config `paste_back: false` 跳過(headless / pure pipe 場景)
-                if *paste_back_enabled {
-                    match paste_back(&text) {
-                        Ok(()) => info!(chars = text.chars().count(), "✓ 轉錄 + 貼回完成"),
-                        Err(e) => {
-                            warn!(error = ?e, "貼回失敗(stdout 還是有印,可自己抓)");
-                            info!(chars = text.chars().count(), "✓ 轉錄完成");
-                        }
-                    }
-                } else {
-                    info!(
-                        chars = text.chars().count(),
-                        "✓ 轉錄完成(paste-back 關閉,只印 stdout)"
-                    );
-                }
             });
         }
     }

@@ -178,6 +178,13 @@ check_deps() {
         command -v xdotool >/dev/null 2>&1 || { missing+=("xdotool"); ok=0; }
     fi
 
+    # yad = 按住熱鍵時的即時預覽視窗。缺了只是沒有預覽,轉錄與貼回照常,所以不算 missing。
+    if command -v yad >/dev/null 2>&1; then
+        echo "  預覽視窗:  ✓ yad 已裝(按住熱鍵會顯示即時文字)"
+    else
+        hints+=("(選用)yad 缺 — 按住熱鍵時不會有即時預覽視窗,長句也不會先給你確認:sudo apt install yad")
+    fi
+
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo "  依賴:     ✗ 缺 ${missing[*]}"
         echo "             sudo apt install ${missing[*]}"

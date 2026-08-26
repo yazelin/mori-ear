@@ -42,6 +42,7 @@ mod audio;
 mod cleanup;
 mod local_stt;
 mod multipart;
+mod preview;
 mod service;
 mod stt;
 mod stt_prompt;
@@ -179,6 +180,52 @@ struct VoiceInputConfig {
     /// 一段至少要累積這麼久才准切(預設 1500),避免切出碎片害 Whisper 認不準。
     #[serde(default = "default_stream_min_segment_ms")]
     stream_min_segment_ms: u32,
+    /// 按住熱鍵時開一個懸浮視窗即時顯示目前解出的文字。需要 `yad`。
+    ///
+    /// **不設的話跟著 `hotkey_mode` 走**:hold 開、toggle 關。
+    /// toggle 是邊講邊貼,字直接出現在游標處,再多一個懸浮視窗只是重複顯示。
+    ///
+    /// 這是 CLAUDE.md「不加 GUI」那條規則的**明確例外**(2026-08-26 yazelin 拍板):
+    /// 語音輸入看不到進度會沒安全感。實作上仍然沒把 GUI 寫進 mori-ear —— 跟
+    /// xclip / xdotool 一樣是 spawn 外部程式,mori-ear 只餵文字給它。
+    #[serde(default)]
+    preview_enabled: Option<bool>,
+    /// 轉出來的字超過這個數量,就跳多行編輯視窗讓你先改再送(預設 150)。
+    /// 只在 hold 模式有意義 —— toggle 是邊講邊貼,要改直接在游標處改。
+    #[serde(default = "default_preview_confirm_chars")]
+    preview_confirm_chars: usize,
+    /// 熱鍵行為:`hold`(預設,按住講話放開停)或 `toggle`(按一下開始,再按一下停)。
+    ///
+    /// toggle 的好處是講話期間沒有按鍵被按住 —— hold 模式下 X11 會因為 XGrabKey
+    /// 攔掉我們注入的 Ctrl+V,所以不可能邊講邊貼;toggle 沒這個限制。
+    /// 代價是忘記按第二下會一直錄,所以有 `toggle_max_secs` 兜底。
+    #[serde(default = "default_hotkey_mode")]
+    hotkey_mode: String,
+    /// toggle 模式下錄超過這麼久就自動停(預設 120 秒)。設 0 = 不自動停。
+    #[serde(default = "default_toggle_max_secs")]
+    toggle_max_secs: u64,
+    /// 每段轉完就直接貼到游標位。**只有 toggle 模式能用**,不設的話 toggle 自動開啟。
+    ///
+    /// hold 模式下不可能:按住熱鍵時 X11 的 XGrabKey 會攔掉我們注入的 Ctrl+V,
+    /// 實測三段都回報「貼回完成」但只有放開後那段真的落地。toggle 期間沒有按鍵
+    /// 被按住,所以沒這個問題。
+    ///
+    /// 跟 `preview_confirm_chars` 互斥:字都邊講邊貼出去了,就沒有「先給你確認」
+    /// 這回事。開了這個,長句確認視窗不會出現。
+    #[serde(default)]
+    live_paste: Option<bool>,
+}
+
+fn default_hotkey_mode() -> String {
+    "hold".to_string()
+}
+
+fn default_toggle_max_secs() -> u64 {
+    120
+}
+
+fn default_preview_confirm_chars() -> usize {
+    150
 }
 
 fn default_stream_enabled() -> bool {
@@ -214,6 +261,11 @@ impl Default for VoiceInputConfig {
             stream_chunks_enabled: default_stream_enabled(),
             stream_pause_ms: default_stream_pause_ms(),
             stream_min_segment_ms: default_stream_min_segment_ms(),
+            preview_enabled: None,
+            preview_confirm_chars: default_preview_confirm_chars(),
+            hotkey_mode: default_hotkey_mode(),
+            toggle_max_secs: default_toggle_max_secs(),
+            live_paste: None,
         }
     }
 }
@@ -842,11 +894,54 @@ async fn run() -> Result<ExitCode> {
         paste_back_enabled: paste_back_arc.clone(),
         backend: backend_arc.clone(),
         timeout: transcribe_timeout,
+        confirm_chars: cfg.voice_input.preview_confirm_chars,
     };
-    // 停頓切出去的各段任務(按順序)+ 背景切段器的把手
-    let segments: Arc<Mutex<Vec<tokio::task::JoinHandle<Option<String>>>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let chunker_slot: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    let preview_slot: Arc<Mutex<Option<preview::Live>>> = Arc::new(Mutex::new(None));
+    let (autostop_tx, mut autostop_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let toggle_mode = cfg.voice_input.hotkey_mode.eq_ignore_ascii_case("toggle");
+    let toggle_max_secs = cfg.voice_input.toggle_max_secs;
+    // 兩種模式各自有合理的預設,沒明寫就跟著 hotkey_mode 走:
+    //   hold   —— 按住期間 XGrabKey 會攔掉注入的 Ctrl+V,不可能邊講邊貼,
+    //             所以用懸浮視窗給回饋,長句再跳多行編輯。
+    //   toggle —— 沒有按鍵被按住,每段直接貼到游標處,懸浮視窗就多餘了。
+    let live_paste = cfg.voice_input.live_paste.unwrap_or(toggle_mode)
+        && toggle_mode
+        && cfg.voice_input.stream_chunks_enabled;
+    if cfg.voice_input.live_paste == Some(true) && !live_paste {
+        warn!(
+            hotkey_mode = %cfg.voice_input.hotkey_mode,
+            stream_chunks_enabled = cfg.voice_input.stream_chunks_enabled,
+            "live_paste 需要 hotkey_mode=toggle 且 stream_chunks_enabled=true,這次不生效"
+        );
+    }
+    if live_paste {
+        info!("邊講邊貼:每段轉完就直接貼到游標位(懸浮視窗與確認視窗因此不需要)");
+    }
+    let want_preview = cfg.voice_input.preview_enabled.unwrap_or(!live_paste);
+    let preview_on = want_preview && preview::available();
+    if want_preview && !preview_on {
+        warn!("要開預覽視窗但找不到 yad,先關掉(`sudo apt install yad`)");
+    }
+    if toggle_mode {
+        info!(
+            toggle_max_secs,
+            "熱鍵是 toggle 模式:按一下開始、再按一下停止(voice_input.hotkey_mode)"
+        );
+    }
+    let session = Session {
+        recorder: recorder.clone(),
+        segments: Arc::new(Mutex::new(Vec::new())),
+        chunker: Arc::new(Mutex::new(None)),
+        autostop: Arc::new(Mutex::new(None)),
+        autostop_tx,
+        preview: preview_slot.clone(),
+        pipeline: pipeline.clone(),
+        trim: trim_cfg,
+        stream: stream_cfg,
+        preview_on,
+        live_paste,
+        emit_turn: Arc::new(Emitter::default()),
+    };
 
     // 對外轉譯服務 —— 讓 AgentOS(http-service skill)/ mori-desktop 當 client 消費 ear 的轉錄。
     // `_service` 綁進 daemon 生命週期(drop = unblock server + 刪 mori-ear-server.json descriptor)。
@@ -889,15 +984,11 @@ async fn run() -> Result<ExitCode> {
                     error!("熱鍵來源全部中斷,退出");
                     return Ok(ExitCode::FAILURE);
                 };
-                handle_event(
-                    edge,
-                    recorder.clone(),
-                    pipeline.clone(),
-                    trim_cfg,
-                    stream_cfg,
-                    segments.clone(),
-                    chunker_slot.clone(),
-                ).await;
+                handle_event(edge, session.clone(), toggle_mode, toggle_max_secs).await;
+            }
+            _ = autostop_rx.recv() => {
+                // toggle 逾時看門狗:錄太久了,替使用者收尾
+                session.stop();
             }
         }
     }
@@ -1347,6 +1438,12 @@ const MIN_DURATION: f32 = 0.25; // 0.25s 以下視為熱鍵誤觸(快按下又�
                                 // 註:單音節中文「好 / 對 / 是」一般 0.25~0.35s
                                 //     講太快被擋的話再下調 0.18
 const MIN_RMS_DB: f32 = -45.0; // -45 dB 以下視為靜音(背景噪音通常 -50 ~ -55 dB)
+/// 剪掉靜音之後至少要剩這麼久的人聲才送 STT。
+///
+/// 平均 RMS 擋不住「1.5 秒裡只有 0.2 秒有聲音」那種:平均起來可能還在門檻之上,
+/// 送給 Whisper 就會吐「祝你生日快樂」「謝謝大家再見」「字幕製作」這類訓練資料
+/// 尾巴。切段模式下這種音訊特別多 —— 停頓久一點就會切出一段幾乎全靜音的。
+const MIN_SPEECH_SECS: f32 = 0.35;
 
 /// 一段語音走完全程需要的東西。每段一份 clone,參數列才不會爆炸。
 #[derive(Clone)]
@@ -1359,6 +1456,8 @@ struct Pipeline {
     paste_back_enabled: Arc<bool>,
     backend: Arc<String>,
     timeout: Duration,
+    /// 超過這麼多字就不直接貼,留在確認視窗等 Enter
+    confirm_chars: usize,
 }
 
 impl Pipeline {
@@ -1366,13 +1465,24 @@ impl Pipeline {
         &self,
         label: &str,
         wav: Vec<u8>,
-        duration_secs: f32,
-        rms_db: f32,
+        enc: audio::Encoded,
     ) -> Option<String> {
-        if wav.is_empty() || duration_secs < MIN_DURATION || rms_db < MIN_RMS_DB {
+        let audio::Encoded {
+            duration_secs,
+            rms_db,
+            speech_secs,
+        } = enc;
+        if wav.is_empty()
+            || duration_secs < MIN_DURATION
+            || rms_db < MIN_RMS_DB
+            || speech_secs < MIN_SPEECH_SECS
+        {
             info!(
                 label,
-                duration_secs, rms_db, "這段太短或太安靜,skip STT(避免 Whisper 幻覺「謝謝」之類)"
+                duration_secs,
+                rms_db,
+                speech_secs,
+                "這段沒有足夠人聲,skip STT(避免 Whisper 幻覺「謝謝大家再見」之類)"
             );
             return None;
         }
@@ -1462,112 +1572,308 @@ fn emit(text: &str, paste_back_enabled: bool) {
     }
 }
 
-async fn handle_event(
-    edge: KeyEdge,
+/// 一次錄音會用到的共享狀態。hold 與 toggle 兩種模式共用同一組開始 / 停止。
+#[derive(Clone)]
+struct Session {
     recorder: Arc<Mutex<Option<audio::Recorder>>>,
+    /// 停頓切出去的各段任務,按講話順序;停止時收回來接成一句
+    segments: Arc<Mutex<Vec<tokio::task::JoinHandle<Option<String>>>>>,
+    chunker: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// toggle 模式的逾時看門狗 —— 忘記按第二下時通知主迴圈收尾。
+    /// 只能用訊號不能直接呼叫 stop():錄音器內含 cpal Stream,不是 Send,
+    /// 搬不進 tokio task。
+    autostop: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    autostop_tx: tokio::sync::mpsc::Sender<()>,
+    preview: Arc<Mutex<Option<preview::Live>>>,
     pipeline: Pipeline,
     trim: audio::TrimConfig,
     stream: StreamConfig,
-    // 停頓切出去的各段任務,按講話順序;放開時收回來接成一句
-    segments: Arc<Mutex<Vec<tokio::task::JoinHandle<Option<String>>>>>,
-    chunker_slot: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-) {
-    match edge {
-        KeyEdge::Pressed => {
-            let mut slot = recorder.lock();
-            if slot.is_some() {
-                warn!("hotkey press 但已在錄音中,忽略");
+    preview_on: bool,
+    /// 每段轉完就貼(只有 toggle 能用)
+    live_paste: bool,
+    /// live_paste 的輸出排序器:下一個該輪到誰貼
+    emit_turn: Arc<Emitter>,
+}
+
+/// 讓併行跑完的分段照講話順序輸出。
+///
+/// 各段的轉譯與 cleanup 是併行的(你還在講話的時候就在跑),完成順序不保證,
+/// 所以貼出去之前要在這裡排隊。
+#[derive(Default)]
+struct Emitter {
+    next: Mutex<usize>,
+    bell: tokio::sync::Notify,
+}
+
+impl Emitter {
+    fn reset(&self) {
+        *self.next.lock() = 0;
+    }
+
+    /// 等到輪到第 `n` 號,執行 `f`,然後放行下一個。
+    async fn in_order(&self, n: usize, f: impl FnOnce()) {
+        loop {
+            if *self.next.lock() == n {
+                break;
+            }
+            self.bell.notified().await;
+        }
+        f();
+        *self.next.lock() = n + 1;
+        self.bell.notify_waiters();
+    }
+}
+
+impl Session {
+    fn is_recording(&self) -> bool {
+        self.recorder.lock().is_some()
+    }
+
+    fn start(&self) {
+        let mut slot = self.recorder.lock();
+        if slot.is_some() {
+            warn!("已在錄音中,忽略");
+            return;
+        }
+        let r = match audio::Recorder::start() {
+            Ok(r) => r,
+            Err(e) => {
+                error!(error = ?e, "錄音啟動失敗");
                 return;
             }
-            match audio::Recorder::start() {
-                Ok(r) => {
-                    info!("🎤 開始錄音");
-                    segments.lock().clear();
-                    if stream.enabled {
-                        let buf = r.buffer();
-                        let (pipe, segs) = (pipeline.clone(), segments.clone());
-                        let chunker = tokio::spawn(async move {
-                            let mut n = 0usize;
-                            loop {
-                                tokio::time::sleep(Duration::from_millis(150)).await;
-                                if buf.secs_buffered() * 1000.0 < stream.min_segment_ms as f32 {
-                                    continue;
-                                }
-                                if !buf.tail_is_silent(stream.pause_ms, stream.threshold) {
-                                    continue;
-                                }
-                                let Some((wav, dur, rms)) = buf.take_wav(&trim) else {
-                                    continue;
-                                };
-                                n += 1;
-                                let label = format!("seg{n}");
-                                info!(label = %label, duration_secs = dur, "偵測到停頓,前段先送出");
-                                let p = pipe.clone();
-                                let task = tokio::spawn(async move {
-                                    p.transcribe_and_clean(&label, wav, dur, rms).await
-                                });
-                                segs.lock().push(task);
-                            }
-                        });
-                        *chunker_slot.lock() = Some(chunker);
-                    }
-                    *slot = Some(r);
-                }
-                Err(e) => error!(error = ?e, "錄音啟動失敗"),
+        };
+        info!("🎤 開始錄音");
+        self.segments.lock().clear();
+        self.emit_turn.reset();
+        if self.preview_on {
+            match preview::Live::open("mori-ear") {
+                // 不寫佔位文字:空視窗本身就是「在聽了」的訊號,第一段轉出來就填進去。
+                // 有佔位文字就得清空才能換掉,一清就閃(見 preview.rs 註解)。
+                Ok(w) => *self.preview.lock() = Some(w),
+                Err(e) => warn!(error = ?e, "預覽視窗開不起來,照常轉錄"),
             }
         }
-        KeyEdge::Released => {
-            // 先停切段器,免得它跟這裡搶同一份 buffer
-            if let Some(h) = chunker_slot.lock().take() {
-                h.abort();
-            }
-            let r = recorder.lock().take();
-            let Some(r) = r else {
-                return;
-            };
-            let done: Vec<_> = std::mem::take(&mut *segments.lock());
-            // 尾巴可能剛被切段器取走 → 0 samples,那不是錯誤,交給守門判
-            let (wav, duration_secs, rms_db) = r
-                .stop_and_encode_wav(trim)
-                .unwrap_or_else(|_| (Vec::new(), 0.0, -90.0));
-            info!(
-                bytes = wav.len(),
-                duration_secs,
-                rms_db,
-                earlier_segments = done.len(),
-                "錄音停止,尾巴送出"
+        if self.stream.enabled {
+            let (buf, stream, trim, live) = (r.buffer(), self.stream, self.trim, self.live_paste);
+            let (pipe, segs, pv, emitter) = (
+                self.pipeline.clone(),
+                self.segments.clone(),
+                self.preview.clone(),
+                self.emit_turn.clone(),
             );
-            let t_release = std::time::Instant::now();
-            tokio::spawn(async move {
-                // 尾巴自己轉;先前各段多半在你講話的時候就跑完了,這裡只是收回來
-                let tail = pipeline
-                    .transcribe_and_clean("tail", wav, duration_secs, rms_db)
-                    .await;
-                let mut parts: Vec<String> = Vec::with_capacity(done.len() + 1);
-                for task in done {
-                    match task.await {
-                        Ok(Some(t)) if !t.trim().is_empty() => parts.push(t.trim().to_string()),
-                        Ok(_) => {}
-                        Err(e) => warn!(error = ?e, "某一段的任務沒收回來,略過"),
+            let chunker = tokio::spawn(async move {
+                let mut n = 0usize;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    if buf.secs_buffered() * 1000.0 < stream.min_segment_ms as f32 {
+                        continue;
                     }
-                }
-                if let Some(t) = tail {
-                    if !t.trim().is_empty() {
-                        parts.push(t.trim().to_string());
+                    if !buf.tail_is_silent(stream.pause_ms, stream.threshold) {
+                        continue;
                     }
+                    let Some((wav, enc)) = buf.take_wav(&trim) else {
+                        continue;
+                    };
+                    n += 1;
+                    let label = format!("seg{n}");
+                    info!(
+                        label = %label,
+                        duration_secs = enc.duration_secs,
+                        speech_secs = enc.speech_secs,
+                        "偵測到停頓,前段先送出"
+                    );
+                    let (p, pv, turn) = (pipe.clone(), pv.clone(), emitter.clone());
+                    let idx = n - 1;
+                    let task = tokio::spawn(async move {
+                        let out = p.transcribe_and_clean(&label, wav, enc).await;
+                        if let Some(t) = out.as_deref() {
+                            // 純追加,不清空(清空會閃、會殘留,見 preview.rs 註解)
+                            if let Some(w) = pv.lock().as_mut() {
+                                w.append(t.trim());
+                            }
+                        }
+                        if !live {
+                            return out;
+                        }
+                        // 邊講邊貼:排隊等前面的段落貼完,自己貼完就放行下一個。
+                        // 回 None 是因為已經貼出去了,不要再併進停止時那一句。
+                        let paste = *p.paste_back_enabled;
+                        turn.in_order(idx, || {
+                            if let Some(t) = out.as_deref() {
+                                if !t.trim().is_empty() {
+                                    emit(t.trim(), paste);
+                                }
+                            }
+                        })
+                        .await;
+                        None
+                    });
+                    segs.lock().push(task);
                 }
-                if parts.is_empty() {
-                    info!("所有分段都沒轉出內容,不貼回");
-                    return;
-                }
-                let segments_done = parts.len();
-                emit(&parts.join(""), *pipeline.paste_back_enabled);
-                info!(
-                    segments = segments_done,
-                    total_after_release_ms = t_release.elapsed().as_millis() as u64,
-                    "放開之後總共等了這麼久"
-                );
             });
+            *self.chunker.lock() = Some(chunker);
         }
+        *slot = Some(r);
+    }
+
+    /// 停止錄音、收回各段、決定直接貼還是等確認。hold 的放開、toggle 的第二下、
+    /// 以及 toggle 的逾時看門狗都走這裡。
+    fn stop(&self) {
+        if let Some(h) = self.autostop.lock().take() {
+            h.abort();
+        }
+        // 先停切段器,免得它跟這裡搶同一份 buffer
+        if let Some(h) = self.chunker.lock().take() {
+            h.abort();
+        }
+        let Some(r) = self.recorder.lock().take() else {
+            return;
+        };
+        let done: Vec<_> = std::mem::take(&mut *self.segments.lock());
+        // 尾巴可能剛被切段器取走 → 0 samples,那不是錯誤,交給守門判
+        let (wav, enc) = r.stop_and_encode_wav(self.trim).unwrap_or_else(|_| {
+            (
+                Vec::new(),
+                audio::Encoded {
+                    duration_secs: 0.0,
+                    rms_db: -90.0,
+                    speech_secs: 0.0,
+                },
+            )
+        });
+        info!(
+            bytes = wav.len(),
+            duration_secs = enc.duration_secs,
+            speech_secs = enc.speech_secs,
+            earlier_segments = done.len(),
+            "錄音停止,尾巴送出"
+        );
+        let t_stop = std::time::Instant::now();
+        // 邊講邊貼時不問確認:前面的段落早就貼出去了,只攔尾巴沒有意義,
+        // 而且要改直接在游標處用鍵盤改就好。
+        let confirm_on = self.preview_on && !self.live_paste;
+        let (pipeline, preview) = (self.pipeline.clone(), self.preview.clone());
+        tokio::spawn(async move {
+            // 尾巴自己轉;先前各段多半在你講話的時候就跑完了,這裡只是收回來
+            let tail = pipeline.transcribe_and_clean("tail", wav, enc).await;
+            let mut parts: Vec<String> = Vec::with_capacity(done.len() + 1);
+            for task in done {
+                match task.await {
+                    Ok(Some(t)) if !t.trim().is_empty() => parts.push(t.trim().to_string()),
+                    Ok(_) => {}
+                    Err(e) => warn!(error = ?e, "某一段的任務沒收回來,略過"),
+                }
+            }
+            if let Some(t) = tail {
+                if !t.trim().is_empty() {
+                    parts.push(t.trim().to_string());
+                }
+            }
+            preview.lock().take(); // 即時預覽的任務到此為止
+            if parts.is_empty() {
+                info!("所有分段都沒轉出內容,不貼回");
+                return;
+            }
+            let text = parts.join("");
+            let chars = text.chars().count();
+            info!(
+                segments = parts.len(),
+                chars,
+                total_after_stop_ms = t_stop.elapsed().as_millis() as u64,
+                "停止之後總共等了這麼久"
+            );
+
+            if !confirm_on || chars <= pipeline.confirm_chars {
+                emit(&text, *pipeline.paste_back_enabled);
+                return;
+            }
+            // 太長 → 留在確認視窗等 Enter。yad 的等待會擋住,丟去 blocking thread。
+            info!(chars, threshold = pipeline.confirm_chars, "太長,先給你確認");
+            let paste = *pipeline.paste_back_enabled;
+            tokio::task::spawn_blocking(move || {
+                match preview::confirm("mori-ear — 可以直接改,Enter 送出 / Esc 丟棄", &text) {
+                    // 送出的是視窗裡當下的文字,使用者可能改過
+                    Ok(preview::Verdict::Send(final_text)) => emit(&final_text, paste),
+                    Ok(preview::Verdict::Discard) => info!("你丟棄了這一段"),
+                    Err(e) => {
+                        warn!(error = ?e, "確認視窗開不起來,直接貼出");
+                        emit(&text, paste);
+                    }
+                }
+            });
+        });
+    }
+
+    /// toggle 模式:忘記按第二下就自己收尾。0 = 不設限。
+    fn arm_autostop(&self, max_secs: u64) {
+        if max_secs == 0 {
+            return;
+        }
+        let tx = self.autostop_tx.clone();
+        let h = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(max_secs)).await;
+            warn!(max_secs, "toggle 錄太久了,自動停止收尾(忘記按第二下?)");
+            let _ = tx.send(()).await;
+        });
+        *self.autostop.lock() = Some(h);
+    }
+}
+
+/// 熱鍵事件 → 開始 / 停止。兩種模式的差別只在這裡。
+async fn handle_event(edge: KeyEdge, session: Session, toggle: bool, toggle_max_secs: u64) {
+    match (toggle, edge) {
+        // hold:按下開始、放開停止
+        (false, KeyEdge::Pressed) => session.start(),
+        (false, KeyEdge::Released) => session.stop(),
+        // toggle:只認按下,一次開一次停;放開不做事
+        (true, KeyEdge::Pressed) => {
+            if session.is_recording() {
+                session.stop();
+            } else {
+                session.start();
+                session.arm_autostop(toggle_max_secs);
+            }
+        }
+        (true, KeyEdge::Released) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 各段的轉譯是併行的,完成順序不保證 —— 但貼出去一定要照講話順序。
+    /// 這裡故意讓後面的段先完成,看排序器有沒有把它擋住。
+    #[tokio::test]
+    async fn emitter_outputs_in_speech_order_even_when_later_segments_finish_first() {
+        let emitter = Arc::new(Emitter::default());
+        let out = Arc::new(Mutex::new(Vec::<usize>::new()));
+
+        let mut tasks = Vec::new();
+        // 倒著送:第 2 段最先呼叫、第 0 段最後
+        for n in (0..3).rev() {
+            let (e, o) = (emitter.clone(), out.clone());
+            tasks.push(tokio::spawn(async move {
+                // 讓倒序的呼叫真的先跑進去
+                tokio::time::sleep(Duration::from_millis(10 * (2 - n) as u64)).await;
+                e.in_order(n, || o.lock().push(n)).await;
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(*out.lock(), vec![0, 1, 2], "輸出必須照講話順序");
+    }
+
+    #[tokio::test]
+    async fn emitter_reset_starts_a_new_utterance_from_zero() {
+        let emitter = Arc::new(Emitter::default());
+        let out = Arc::new(Mutex::new(Vec::<usize>::new()));
+        emitter.in_order(0, || out.lock().push(0)).await;
+        emitter.in_order(1, || out.lock().push(1)).await;
+        // 下一句從頭開始編號,沒 reset 的話會永遠等不到
+        emitter.reset();
+        emitter.in_order(0, || out.lock().push(100)).await;
+        assert_eq!(*out.lock(), vec![0, 1, 100]);
     }
 }

@@ -4,7 +4,9 @@ For Claude / agents working in this repo. README.md is the human-facing entry po
 
 ## What this is
 
-A minimal Rust CLI: global hotkey → microphone capture → STT → Groq LLM cleanup → clipboard + Ctrl+V paste-back into the focused window. The hotkey has **two sources** that both collapse into one internal `KeyEdge` (`Pressed`/`Released`) before reaching `handle_event`: `global-hotkey` (X11 / Windows) and the `GlobalShortcuts` portal (`src/wayland_hotkey.rs`, Wayland). There is **no toggle mode** — this organ is hold-only; the thing with `ToggleMode` is mori-desktop's `hotkeys.toggle_mode`, don't conflate them. No GUI, no tray, no persistent state. The "ear" organ in the Mori universe — runs as an independent process so mori-desktop restarts don't kill voice input.
+A minimal Rust CLI: global hotkey → microphone capture → STT → Groq LLM cleanup → clipboard + Ctrl+V paste-back into the focused window. The hotkey has **two sources** that both collapse into one internal `KeyEdge` (`Pressed`/`Released`) before reaching `handle_event`: `global-hotkey` (X11 / Windows) and the `GlobalShortcuts` portal (`src/wayland_hotkey.rs`, Wayland). The hotkey has **two modes** (`ear.json` `voice_input.hotkey_mode`, default `hold`): `hold` (press and hold, release to stop) and `toggle` (press once to start, press again to stop, with a `toggle_max_secs` watchdog for when you forget). This is separate from mori-desktop's `hotkeys.toggle_mode` — same idea, different process, don't conflate them.
+
+Toggle exists for one concrete reason: **while the hotkey is physically held, X11 has an active keyboard grab and any `Ctrl+V` we inject never reaches the focused window.** Measured 2026-08-26: three segments all logged "貼回完成" and only the one pasted after release actually landed. Toggle has no key held, so per-segment paste works — that's `voice_input.live_paste`. No GUI, no tray, no persistent state. The "ear" organ in the Mori universe — runs as an independent process so mori-desktop restarts don't kill voice input.
 
 STT has two backends (config `backend`, default `auto`): **Groq Whisper API** (cloud, fast) and a **local whisper-server** (the shared `~/.mori/whisper-server.json` discovery contract — see `src/local_stt.rs`). `auto` prefers local whisper-server first (data stays on-device), falls back to Groq on local failure (when a key exists); `groq` / `local` force one. mori-ear is an **Adopter** of the local server: it never *writes or locks* the descriptor (the Starter/Owner — today mori-meeting-recorder's `mori-whisper-serve` supervisor — does that). When the local server is offline, mori-ear may **request an on-demand start** via the contract §11 idempotent entry `~/.mori/bin/mori-whisper-serve --ensure` (it kicks the supervisor, which is the real Starter), then polls ≤15s for ready — see `wake_and_wait` in `src/local_stt.rs`. standalone-first: no supervisor / wake times out → fall back to Groq (`auto`) or error (`local`). Cleanup stays Groq; offline (no key) → STT goes local + cleanup is skipped (raw output).
 
@@ -180,6 +182,22 @@ Tune in `src/main.rs` constants `MIN_DURATION` / `MIN_RMS_DB`. The thresholds in
 }
 ```
 
+**(c) Not enough actual speech** — `speech_secs` (how much audio survives trimming) below
+`MIN_SPEECH_SECS` (0.35) skips the segment. Average RMS cannot catch "1.5 seconds with
+0.2s of speech in it": the average still clears the gate, and Whisper answers with
+「祝你生日快樂」「謝謝大家再見」「字幕製作」. This matters much more in chunk mode — a longer
+pause produces a segment that is almost entirely silence.
+
+### 講到一半就先送(`voice_input.stream_chunks_*`)
+
+按住 / toggle 期間背景偵測停頓(尾巴靜音 `stream_pause_ms` 且已累積 `stream_min_segment_ms`),
+切一段就丟去轉譯 + cleanup。放開時只剩尾巴要跑。實測放開到貼回從 0.9–1.4s 降到 0.75s。
+
+cleanup 因此變成**逐段**做,接縫的標點會比整句做差一點 —— 換到的是等待變短。要回舊行為設
+`stream_chunks_enabled: false`。切段**救不了 OOM 也救不了長句品質**,它只買時間。
+
+各段的轉譯併行、完成順序不保證,所以輸出前要過 `Emitter`(main.rs)排隊,保證照講話順序。
+
 Internal-pause removal is intentionally conservative (only ≥300ms) so Whisper keeps natural pauses as sentence-boundary cues. The skip gate still uses **average** RMS (not mori-desktop's peak-RMS-over-100ms-window upgrade) — a known limitation if you say a few words then leave a long silent tail.
 
 ## CI / release
@@ -189,7 +207,12 @@ Internal-pause removal is intentionally conservative (only ≥300ms) so Whisper 
 
 ## What to NOT do
 
-- Do not add a tray icon / GUI to mori-ear. That's mori-desktop's job.
+- Do not add a tray icon or a persistent GUI to mori-ear. That's mori-desktop's job.
+  **One deliberate exception (2026-08-26, yazelin's call):** the transient preview /
+  confirm windows in `src/preview.rs`. They spawn `yad` the same way paste-back spawns
+  `xclip` / `xdotool` — there is still no drawing code, no toolkit dependency, and no
+  window mori-ear owns for longer than one utterance. Missing `yad` just turns the
+  feature off; transcription is unaffected. Do not grow this into a real GUI.
 - Do not add a feature toggle for "skip cleanup" to ear.json beyond the existing `raw` flag — the cleanup LLM is the difference between "謝謝你訂閱頻道" hallucinations and clean繁中.
 - Do not introduce a tokio task that polls `GlobalHotKeyEvent::receiver()` on a tokio worker on Windows. See gotcha above.
 - Do not auto-update `~/.mori/config.json` from mori-ear. That file is mori-desktop's source of truth; mori-ear is a read-only consumer of `providers.groq.api_key`.

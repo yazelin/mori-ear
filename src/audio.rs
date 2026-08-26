@@ -122,7 +122,7 @@ impl Recorder {
     /// 守門用(行為不變);實際編進 WAV 的是**剪裁後**的 samples(`trim` 決定)。
     /// Whisper 對安靜 audio 會幻覺出「謝謝」「請訂閱」之類訓練資料尾巴,所以前後
     /// 靜音 + 中間長停頓在送出前先剪掉。
-    pub fn stop_and_encode_wav(self, trim: TrimConfig) -> Result<(Vec<u8>, f32, f32)> {
+    pub fn stop_and_encode_wav(self, trim: TrimConfig) -> Result<(Vec<u8>, Encoded)> {
         let Self {
             samples,
             sample_rate,
@@ -170,19 +170,32 @@ impl BufferHandle {
     }
 
     /// 把目前累積的 samples 整段取走並編成 WAV,錄音繼續。沒東西可取回 None。
-    pub fn take_wav(&self, trim: &TrimConfig) -> Option<(Vec<u8>, f32, f32)> {
+    pub fn take_wav(&self, trim: &TrimConfig) -> Option<(Vec<u8>, Encoded)> {
         let raw = std::mem::take(&mut *self.samples.lock());
         encode(raw, self.sample_rate, self.channels, trim).ok()
     }
 }
 
+/// 一段錄音編碼後的樣子。
+#[derive(Debug, Clone, Copy)]
+pub struct Encoded {
+    /// 整段長度(剪裁前),秒。
+    pub duration_secs: f32,
+    /// 整段平均 RMS,dB。
+    pub rms_db: f32,
+    /// **剪掉靜音之後**還剩多少,秒 —— 這才是「講了多久」。
+    ///
+    /// 平均 RMS 擋不住「1.5 秒裡只有 0.2 秒有聲音」那種:平均起來可能還在門檻之上,
+    /// 送給 Whisper 就會幻覺出「謝謝大家再見」「字幕製作」之類訓練資料尾巴。
+    /// 切段模式下這種音訊特別多(停頓久一點就會切出一段幾乎全靜音的)。
+    pub speech_secs: f32,
+}
+
 /// mono 化 → 算整段 RMS/長度 → 剪靜音 → 編 16-bit PCM WAV。
 ///
-/// `rms_db` / `duration_secs` 用**整段(剪裁前)**算,給 caller 的 silence skip
-/// 守門用(行為不變);實際編進 WAV 的是**剪裁後**的 samples。
-/// Whisper 對安靜 audio 會幻覺出「謝謝」「請訂閱」之類訓練資料尾巴,所以前後
-/// 靜音 + 中間長停頓在送出前先剪掉。
-fn encode(raw: Vec<f32>, sample_rate: u32, channels: u16, trim: &TrimConfig) -> Result<(Vec<u8>, f32, f32)> {
+/// `rms_db` / `duration_secs` 用**整段(剪裁前)**算,維持既有 skip 守門的行為;
+/// 實際編進 WAV 的是**剪裁後**的 samples,長度另外回在 `speech_secs`。
+fn encode(raw: Vec<f32>, sample_rate: u32, channels: u16, trim: &TrimConfig) -> Result<(Vec<u8>, Encoded)> {
     if raw.is_empty() {
         anyhow::bail!("錄到 0 samples");
     }
@@ -201,6 +214,8 @@ fn encode(raw: Vec<f32>, sample_rate: u32, channels: u16, trim: &TrimConfig) -> 
     let duration_secs = mono.len() as f32 / sample_rate as f32;
 
     let trimmed = apply_trim(&mono, sample_rate, trim);
+    // 全靜音時 apply_trim 回空,這裡照舊 fallback 送原段,但 speech_secs 誠實回 0
+    let speech_secs = trimmed.len() as f32 / sample_rate as f32;
     let to_encode: &[f32] = if trimmed.is_empty() { &mono } else { &trimmed };
     if to_encode.len() != mono.len() {
         tracing::info!(
@@ -227,7 +242,14 @@ fn encode(raw: Vec<f32>, sample_rate: u32, channels: u16, trim: &TrimConfig) -> 
         }
         w.finalize().context("finalize WAV")?;
     }
-    Ok((buf.into_inner(), duration_secs, rms_db))
+    Ok((
+        buf.into_inner(),
+        Encoded {
+            duration_secs,
+            rms_db,
+            speech_secs,
+        },
+    ))
 }
 
 /// 單一視窗的 RMS(線性,0~1)。空 → 0。
@@ -444,16 +466,41 @@ mod tests {
     }
 
     #[test]
+    fn speech_secs_is_near_zero_for_a_mostly_silent_segment() {
+        // 1.5 秒裡只有 0.15 秒有聲音 —— 平均 RMS 可能還過得了門檻,
+        // 但這種送進 Whisper 就會幻覺出「謝謝大家再見」
+        let mut samples = buf_tone(150, 0.5);
+        samples.extend(buf_tone(1350, 0.0));
+        let h = BufferHandle::from_samples(samples, SR, 1);
+        let (_, enc) = h.take_wav(&TrimConfig::default()).expect("取得到");
+        assert!(
+            enc.speech_secs < 0.4,
+            "幾乎全靜音的段落 speech_secs 該接近 0,實際 {}",
+            enc.speech_secs
+        );
+        assert!(enc.duration_secs > 1.4, "整段長度仍是 1.5 秒");
+    }
+
+    #[test]
     fn take_wav_drains_so_next_segment_starts_fresh() {
         let mut samples = buf_tone(1500, 0.5);
         samples.extend(buf_tone(800, 0.0));
         let h = BufferHandle::from_samples(samples, SR, 1);
         let trim = TrimConfig::default();
 
-        let (wav, dur, rms_db) = h.take_wav(&trim).expect("第一段應該取得到");
+        let (wav, enc) = h.take_wav(&trim).expect("第一段應該取得到");
         assert!(!wav.is_empty());
-        assert!(dur > 2.0, "duration 用整段(剪裁前)算,應該 2.3 秒左右,實際 {dur}");
-        assert!(rms_db > -45.0, "有人聲,不該被當成靜音,實際 {rms_db}");
+        assert!(
+            enc.duration_secs > 2.0,
+            "duration 用整段(剪裁前)算,應該 2.3 秒左右,實際 {}",
+            enc.duration_secs
+        );
+        assert!(enc.rms_db > -45.0, "有人聲,不該被當成靜音,實際 {}", enc.rms_db);
+        assert!(
+            enc.speech_secs > 1.2 && enc.speech_secs < 1.8,
+            "剪掉尾巴 800ms 靜音後應該剩 1.5 秒左右,實際 {}",
+            enc.speech_secs
+        );
 
         assert!(h.take_wav(&trim).is_none(), "取走之後 buffer 應該空了");
         assert_eq!(h.secs_buffered(), 0.0);

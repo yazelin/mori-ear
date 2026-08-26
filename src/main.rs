@@ -194,7 +194,10 @@ struct VoiceInputConfig {
     /// 只在 hold 模式有意義 —— toggle 是邊講邊貼,要改直接在游標處改。
     #[serde(default = "default_preview_confirm_chars")]
     preview_confirm_chars: usize,
-    /// 熱鍵行為:`hold`(預設,按住講話放開停)或 `toggle`(按一下開始,再按一下停)。
+    /// 熱鍵行為:`toggle`(預設,按一下開始、再按一下停)或 `hold`(按住講話、放開停)。
+    ///
+    /// 預設 toggle 是為了跟 mori-desktop 的按鈕一致(它也是 toggle),而且 toggle
+    /// 期間沒有按鍵被按住,才做得到邊講邊貼。
     ///
     /// toggle 的好處是講話期間沒有按鍵被按住 —— hold 模式下 X11 會因為 XGrabKey
     /// 攔掉我們注入的 Ctrl+V,所以不可能邊講邊貼;toggle 沒這個限制。
@@ -217,7 +220,7 @@ struct VoiceInputConfig {
 }
 
 fn default_hotkey_mode() -> String {
-    "hold".to_string()
+    "toggle".to_string()
 }
 
 fn default_toggle_max_secs() -> u64 {

@@ -106,13 +106,23 @@ impl Recorder {
         })
     }
 
+    /// 錄音中也能取用的緩衝把手 —— 給「講到一半的停頓就先送 STT」用。
+    /// 只帶 samples buffer + 格式,不帶 cpal Stream(那個不是 Sync,跨執行緒不好搬)。
+    pub fn buffer(&self) -> BufferHandle {
+        BufferHandle {
+            samples: self.samples.clone(),
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        }
+    }
+
     /// 停止錄音 + 編 WAV(16-bit PCM,mono)。回 (wav bytes, duration_secs, rms_db)。
     ///
     /// `rms_db` / `duration_secs` 用**整段(剪裁前)**算,給 caller 的 silence skip
     /// 守門用(行為不變);實際編進 WAV 的是**剪裁後**的 samples(`trim` 決定)。
     /// Whisper 對安靜 audio 會幻覺出「謝謝」「請訂閱」之類訓練資料尾巴,所以前後
     /// 靜音 + 中間長停頓在送出前先剪掉。
-    pub fn stop_and_encode_wav(self, trim: TrimConfig) -> Result<(Vec<u8>, f32, f32)> {
+    pub fn stop_and_encode_wav(self, trim: TrimConfig) -> Result<(Vec<u8>, Encoded)> {
         let Self {
             samples,
             sample_rate,
@@ -122,57 +132,124 @@ impl Recorder {
         drop(_stream);
 
         let raw = std::mem::take(&mut *samples.lock());
-        if raw.is_empty() {
-            anyhow::bail!("錄到 0 samples");
-        }
-
-        // 多聲道 → mono(每 channels 個取平均)
-        let mono: Vec<f32> = if channels == 1 {
-            raw
-        } else {
-            raw.chunks(channels as usize)
-                .map(|frame| frame.iter().sum::<f32>() / (channels as f32))
-                .collect()
-        };
-
-        // RMS + duration:在**整段**mono samples 上算,給 caller 判斷 silence skip
-        // (剪裁不改這兩個值 → skip 守門行為不變)。
-        let sum_sq: f32 = mono.iter().map(|&s| s * s).sum();
-        let rms = (sum_sq / mono.len() as f32).sqrt();
-        let rms_db = if rms > 0.0 { 20.0 * rms.log10() } else { -90.0 };
-        let duration_secs = mono.len() as f32 / sample_rate as f32;
-
-        // 剪靜音:首尾(任意長度)+ 中間連續長停頓。全靜音則 fallback 送原段
-        // (交給 caller 的 skip 守門擋,絕不送空 WAV)。
-        let trimmed = apply_trim(&mono, sample_rate, &trim);
-        let to_encode: &[f32] = if trimmed.is_empty() { &mono } else { &trimmed };
-        if to_encode.len() != mono.len() {
-            tracing::info!(
-                orig_samples = mono.len(),
-                kept_samples = to_encode.len(),
-                threshold = trim.threshold,
-                min_silence_ms = trim.min_silence_ms,
-                "靜音剪裁(首尾 + 中間連續靜音)"
-            );
-        }
-
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut buf = std::io::Cursor::new(Vec::<u8>::new());
-        {
-            let mut w = hound::WavWriter::new(&mut buf, spec).context("hound writer")?;
-            for &s in to_encode {
-                let s = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                w.write_sample(s).context("write sample")?;
-            }
-            w.finalize().context("finalize WAV")?;
-        }
-        Ok((buf.into_inner(), duration_secs, rms_db))
+        encode(raw, sample_rate, channels, &trim)
     }
+}
+
+/// 錄音進行中的緩衝把手。可以問「錄了多久」「尾巴是不是靜音」,也可以把目前
+/// 累積的部分整段取走編成 WAV(取走之後錄音繼續,新的 samples 從頭累積)。
+#[derive(Clone)]
+pub struct BufferHandle {
+    samples: Arc<Mutex<Vec<f32>>>,
+    sample_rate: u32,
+    channels: u16,
+}
+
+impl BufferHandle {
+    /// 測試用:直接從 samples 造一個把手,不需要真的 audio device。
+    #[cfg(test)]
+    fn from_samples(samples: Vec<f32>, sample_rate: u32, channels: u16) -> Self {
+        Self { samples: Arc::new(Mutex::new(samples)), sample_rate, channels }
+    }
+
+    /// 目前累積了幾秒。
+    pub fn secs_buffered(&self) -> f32 {
+        let n = self.samples.lock().len();
+        n as f32 / (self.sample_rate as f32 * self.channels as f32)
+    }
+
+    /// 最後 `tail_ms` 毫秒是不是都低於門檻(= 講話停頓了)。
+    /// 累積不足 `tail_ms` 一律回 false,避免一開始就被判成停頓。
+    pub fn tail_is_silent(&self, tail_ms: u32, threshold: f32) -> bool {
+        let want = (self.sample_rate as usize * self.channels as usize) * tail_ms as usize / 1000;
+        let buf = self.samples.lock();
+        if want == 0 || buf.len() < want {
+            return false;
+        }
+        frame_rms(&buf[buf.len() - want..]) < threshold
+    }
+
+    /// 把目前累積的 samples 整段取走並編成 WAV,錄音繼續。沒東西可取回 None。
+    pub fn take_wav(&self, trim: &TrimConfig) -> Option<(Vec<u8>, Encoded)> {
+        let raw = std::mem::take(&mut *self.samples.lock());
+        encode(raw, self.sample_rate, self.channels, trim).ok()
+    }
+}
+
+/// 一段錄音編碼後的樣子。
+#[derive(Debug, Clone, Copy)]
+pub struct Encoded {
+    /// 整段長度(剪裁前),秒。
+    pub duration_secs: f32,
+    /// 整段平均 RMS,dB。
+    pub rms_db: f32,
+    /// **剪掉靜音之後**還剩多少,秒 —— 這才是「講了多久」。
+    ///
+    /// 平均 RMS 擋不住「1.5 秒裡只有 0.2 秒有聲音」那種:平均起來可能還在門檻之上,
+    /// 送給 Whisper 就會幻覺出「謝謝大家再見」「字幕製作」之類訓練資料尾巴。
+    /// 切段模式下這種音訊特別多(停頓久一點就會切出一段幾乎全靜音的)。
+    pub speech_secs: f32,
+}
+
+/// mono 化 → 算整段 RMS/長度 → 剪靜音 → 編 16-bit PCM WAV。
+///
+/// `rms_db` / `duration_secs` 用**整段(剪裁前)**算,維持既有 skip 守門的行為;
+/// 實際編進 WAV 的是**剪裁後**的 samples,長度另外回在 `speech_secs`。
+fn encode(raw: Vec<f32>, sample_rate: u32, channels: u16, trim: &TrimConfig) -> Result<(Vec<u8>, Encoded)> {
+    if raw.is_empty() {
+        anyhow::bail!("錄到 0 samples");
+    }
+    // 多聲道 → mono(每 channels 個取平均)
+    let mono: Vec<f32> = if channels == 1 {
+        raw
+    } else {
+        raw.chunks(channels as usize)
+            .map(|frame| frame.iter().sum::<f32>() / (channels as f32))
+            .collect()
+    };
+
+    let sum_sq: f32 = mono.iter().map(|&s| s * s).sum();
+    let rms = (sum_sq / mono.len() as f32).sqrt();
+    let rms_db = if rms > 0.0 { 20.0 * rms.log10() } else { -90.0 };
+    let duration_secs = mono.len() as f32 / sample_rate as f32;
+
+    let trimmed = apply_trim(&mono, sample_rate, trim);
+    // 全靜音時 apply_trim 回空,這裡照舊 fallback 送原段,但 speech_secs 誠實回 0
+    let speech_secs = trimmed.len() as f32 / sample_rate as f32;
+    let to_encode: &[f32] = if trimmed.is_empty() { &mono } else { &trimmed };
+    if to_encode.len() != mono.len() {
+        tracing::info!(
+            orig_samples = mono.len(),
+            kept_samples = to_encode.len(),
+            threshold = trim.threshold,
+            min_silence_ms = trim.min_silence_ms,
+            "靜音剪裁(首尾 + 中間連續靜音)"
+        );
+    }
+
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut buf = std::io::Cursor::new(Vec::<u8>::new());
+    {
+        let mut w = hound::WavWriter::new(&mut buf, spec).context("hound writer")?;
+        for &s in to_encode {
+            let s = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            w.write_sample(s).context("write sample")?;
+        }
+        w.finalize().context("finalize WAV")?;
+    }
+    Ok((
+        buf.into_inner(),
+        Encoded {
+            duration_secs,
+            rms_db,
+            speech_secs,
+        },
+    ))
 }
 
 /// 單一視窗的 RMS(線性,0~1)。空 → 0。
@@ -347,5 +424,85 @@ mod tests {
             ..TrimConfig::default()
         };
         assert_eq!(apply_trim(&sig, SR, &cfg), sig);
+    }
+
+    // ── 講到一半就先送 STT 用的緩衝把手 ──────────────────────────────
+
+    /// 造 `ms` 毫秒的訊號,振幅 `amp`(0 = 靜音)。
+    fn buf_tone(ms: u32, amp: f32) -> Vec<f32> {
+        let n = (SR as usize) * ms as usize / 1000;
+        (0..n).map(|i| if i % 2 == 0 { amp } else { -amp }).collect()
+    }
+
+    #[test]
+    fn secs_buffered_counts_channels() {
+        let h = BufferHandle::from_samples(buf_tone(1000, 0.5), SR, 1);
+        assert!((h.secs_buffered() - 1.0).abs() < 0.01);
+        // 雙聲道:同樣的 sample 數只有一半的時間
+        let h2 = BufferHandle::from_samples(buf_tone(1000, 0.5), SR, 2);
+        assert!((h2.secs_buffered() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn tail_is_silent_detects_a_pause() {
+        let mut samples = buf_tone(2000, 0.5);
+        samples.extend(buf_tone(800, 0.0)); // 講完之後停 800ms
+        let h = BufferHandle::from_samples(samples, SR, 1);
+        assert!(h.tail_is_silent(700, 0.02), "尾巴 800ms 靜音應該判成停頓");
+        assert!(!h.tail_is_silent(1200, 0.02), "看回 1200ms 會吃到人聲,不算停頓");
+    }
+
+    #[test]
+    fn tail_is_silent_false_while_still_talking() {
+        let h = BufferHandle::from_samples(buf_tone(3000, 0.5), SR, 1);
+        assert!(!h.tail_is_silent(700, 0.02));
+    }
+
+    #[test]
+    fn tail_is_silent_false_when_buffer_too_short() {
+        // 只錄了 300ms,不該因為「還沒累積到 700ms」就被當成停頓
+        let h = BufferHandle::from_samples(buf_tone(300, 0.0), SR, 1);
+        assert!(!h.tail_is_silent(700, 0.02));
+    }
+
+    #[test]
+    fn speech_secs_is_near_zero_for_a_mostly_silent_segment() {
+        // 1.5 秒裡只有 0.15 秒有聲音 —— 平均 RMS 可能還過得了門檻,
+        // 但這種送進 Whisper 就會幻覺出「謝謝大家再見」
+        let mut samples = buf_tone(150, 0.5);
+        samples.extend(buf_tone(1350, 0.0));
+        let h = BufferHandle::from_samples(samples, SR, 1);
+        let (_, enc) = h.take_wav(&TrimConfig::default()).expect("取得到");
+        assert!(
+            enc.speech_secs < 0.4,
+            "幾乎全靜音的段落 speech_secs 該接近 0,實際 {}",
+            enc.speech_secs
+        );
+        assert!(enc.duration_secs > 1.4, "整段長度仍是 1.5 秒");
+    }
+
+    #[test]
+    fn take_wav_drains_so_next_segment_starts_fresh() {
+        let mut samples = buf_tone(1500, 0.5);
+        samples.extend(buf_tone(800, 0.0));
+        let h = BufferHandle::from_samples(samples, SR, 1);
+        let trim = TrimConfig::default();
+
+        let (wav, enc) = h.take_wav(&trim).expect("第一段應該取得到");
+        assert!(!wav.is_empty());
+        assert!(
+            enc.duration_secs > 2.0,
+            "duration 用整段(剪裁前)算,應該 2.3 秒左右,實際 {}",
+            enc.duration_secs
+        );
+        assert!(enc.rms_db > -45.0, "有人聲,不該被當成靜音,實際 {}", enc.rms_db);
+        assert!(
+            enc.speech_secs > 1.2 && enc.speech_secs < 1.8,
+            "剪掉尾巴 800ms 靜音後應該剩 1.5 秒左右,實際 {}",
+            enc.speech_secs
+        );
+
+        assert!(h.take_wav(&trim).is_none(), "取走之後 buffer 應該空了");
+        assert_eq!(h.secs_buffered(), 0.0);
     }
 }

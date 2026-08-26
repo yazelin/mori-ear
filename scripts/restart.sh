@@ -16,8 +16,15 @@ cd "$(dirname "$0")/.."
 
 MODE="${1:-debug}"
 
+# mori-ear 被 SIGKILL 時沒機會跑 Drop,它開的 yad 預覽視窗會活下來,
+# 還繼承著 single-instance 的 abstract socket → 下一個 mori-ear 起不來。
+kill_stray_yad() {
+    pkill -9 -f 'yad .*--title=mori-ear' 2>/dev/null || true
+}
+
 if [[ "$MODE" == "--stop" ]]; then
     pkill mori-ear 2>/dev/null || true
+    kill_stray_yad
     sleep 1
     if pgrep -x mori-ear > /dev/null; then
         echo "❌ 殺不掉 mori-ear,還在跑:$(pgrep -x mori-ear)"
@@ -39,6 +46,7 @@ fi
 
 echo "→ pkill -9 mori-ear(force kill 確保 single-instance abstract socket 立即釋放)"
 pkill -9 -x mori-ear 2>/dev/null || true
+kill_stray_yad   # SIGKILL 過的 mori-ear 沒機會收掉自己開的預覽視窗
 # poll 直到 pgrep 真的空,最多 5 秒
 for i in 1 2 3 4 5; do
     if ! pgrep -x mori-ear > /dev/null; then

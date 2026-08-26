@@ -1,6 +1,6 @@
 # mori-ear GitHub Pages site
 
-Static HTML served from `/docs/` on `main`. No Jekyll (see `.nojekyll`).
+Static HTML served from `/docs/` on `main`. No Jekyll (see `.nojekyll`).頁面內容以 Rust 實作為準：目前預設是 toggle 熱鍵、停頓分段轉譯、`auto` 本機 STT 優先，並開啟 loopback HTTP service。新的運作模式目前只在 Linux X11 實測；Windows、Wayland 與 macOS 不列入這次實測保證。
 
 ## Local preview
 
@@ -15,7 +15,7 @@ npx http-server docs -p 8765 -s
 
 ```
 docs/
-  index.html          ← 主頁(繁中)
+  index.html          ← 主頁(繁中：安裝、toggle / hold、STT backend、HTTP service、平台支援)
   styles.css          ← Mori brand tokens(forest dark + ivory light 雙主題)
   scripts.js          ← theme toggle + copy-to-clipboard
   .nojekyll           ← 關掉 Jekyll(直接出靜態 HTML)
@@ -36,7 +36,9 @@ docs/
 - **mascot**:Mori(森林精靈 — 長綠髮、白花、漢服)用 `mori-recording` sprite 當「在聽」hero
 - **dual theme**:dark = 森林夜、light = 林光紙,brand book 都有 spec
 
-`assets/mockups/mori-ear-mockup.png` 是 [codex-imagegen-skill](https://github.com/yazelin/codex-imagegen-skill) 在 image-edit 模式餵 mori-desktop 的 `mori-brand.png` 當 reference 生出來的設計稿,當作 layout / mood 的視覺基準。實作的 HTML/CSS 對齊那張圖的氛圍但用真資料。
+`assets/mockups/mori-ear-mockup.png` 是 [codex-imagegen-skill](https://github.com/yazelin/codex-imagegen-skill) 在 image-edit 模式餵 mori-desktop 的 `mori-brand.png` 當 reference 生出來的設計稿，當作 layout / mood 的視覺基準。實作的 HTML/CSS 對齊那張圖的氛圍但用真資料。
+
+更新頁面文案時，先核對 `src/main.rs`、`src/audio.rs`、`src/local_stt.rs`、`src/service.rs` 與 `src/wayland_hotkey.rs` 的實際行為，再同步 README。尤其不要把 `--serve`、`~/.mori/mori-ear-server.json`、本機 whisper-server 或 toggle / hold 的差異寫成舊版的單一路徑。
 
 要重生 mockup:
 

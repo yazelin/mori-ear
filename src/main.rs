@@ -8,14 +8,16 @@
 
 //! mori-ear:Mori 的「耳朵」器官 — 極簡 CLI。
 //!
-//! 流程:
-//!   全域熱鍵按下 → 開麥克風錄音
-//!   全域熱鍵放開 → 停止錄音 → 編 WAV → POST Groq Whisper → 印 transcript 到 stdout
+//! 預設流程:
+//!   全域熱鍵(toggle 按下) → 開麥克風錄音 → 停頓時分段送 STT
+//!   再按一下 → 收尾最後一段 → 可選 cleanup → 印 stdout 並貼回焦點視窗
+//!
+//! 也支援 hold 模式(按住錄、放開停)、`--input <wav>` 批次轉譯,以及
+//! `--serve` loopback HTTP service。`backend=auto` 先找本機 whisper-server,
+//! 不可用才 fallback Groq；`raw` 或沒有 cleanup key 時會保留原始 STT。
 //!
 //! 不做(故意):
-//!   - 沒 GUI / tray
-//!   - 沒 paste-back(transcript 走 stdout,user 自己 pipe / 抓)
-//!   - 沒 cleanup LLM(原始轉錄就送出)
+//!   - 沒內建 GUI / tray(hold 預覽使用可選的外部 `yad`)
 //!   - 沒 voice profile / 校正詞庫
 //!
 //! 熱鍵有兩條來源,都收斂成同一個 [`KeyEdge`] 餵給 `handle_event`:
@@ -52,7 +54,7 @@ mod wayland_hotkey;
 
 const DEFAULT_HOTKEY: &str = "Ctrl+Alt+E";
 
-/// 熱鍵的一次邊緣事件 —— 這顆器官只有 hold 語意:按下開錄、放開停錄。
+/// 熱鍵的一次邊緣事件 —— hold 用按下/放開,toggle 只消費按下事件。
 ///
 /// 存在的理由是**解耦事件來源**:X11/Windows 走 `global-hotkey` 的
 /// [`HotKeyState`],Wayland 走 portal 的 Activated/Deactivated,兩邊收斂成
@@ -109,7 +111,7 @@ struct Config {
     /// 所以主要在 terminal 打字的人要自己設 `"paste_key": "ctrl+shift+v"`。
     #[serde(default = "default_paste_key")]
     paste_key: String,
-    /// STT backend:`auto`(預設,Groq 優先、失敗/無 key → 本地 whisper-server)
+    /// STT backend:`auto`(預設,本地 whisper-server 優先、失敗/無法使用 → Groq)
     /// / `groq`(只 Groq)/ `local`(只本地 whisper-server,隱私、不碰 Groq)。
     #[serde(default = "default_backend")]
     backend: String,
@@ -167,11 +169,9 @@ struct VoiceInputConfig {
     /// 線性振幅門檻(預設 0.02 ≈ -34 dBFS,對齊 mori-desktop)。
     #[serde(default = "default_trim_threshold")]
     trim_silence_threshold: f32,
-    /// 講到一半的停頓就把前段先轉譯掉(預設 true),放開時只剩尾巴要等。
-    ///
-    /// 貼上仍然是放開之後一次貼完 —— 按住熱鍵時 X11 有鍵盤 grab,
-    /// 這時候注入的 Ctrl+V 送不到焦點視窗(實測會整段消失),所以不能邊講邊貼。
-    /// 關掉 = 舊行為:放開才整段送、整句 cleanup。
+    /// 講到一半的停頓就把前段先轉譯掉(預設 true),停止時只剩尾巴要等。
+    /// toggle 會把完成的段落直接貼回；hold 仍在放開後一次貼完(按住熱鍵時
+    /// X11 keyboard grab 會攔掉注入的 Ctrl+V)。關掉則回到停止後整段送出。
     #[serde(default = "default_stream_enabled")]
     stream_chunks_enabled: bool,
     /// 尾巴連續這麼多毫秒低於門檻就算一個停頓、可以切段(預設 700)。
@@ -180,7 +180,7 @@ struct VoiceInputConfig {
     /// 一段至少要累積這麼久才准切(預設 1500),避免切出碎片害 Whisper 認不準。
     #[serde(default = "default_stream_min_segment_ms")]
     stream_min_segment_ms: u32,
-    /// 按住熱鍵時開一個懸浮視窗即時顯示目前解出的文字。需要 `yad`。
+    /// hold 模式開一個懸浮視窗即時顯示目前解出的文字。需要 `yad`。
     ///
     /// **不設的話跟著 `hotkey_mode` 走**:hold 開、toggle 關。
     /// toggle 是邊講邊貼,字直接出現在游標處,再多一個懸浮視窗只是重複顯示。
@@ -337,8 +337,8 @@ impl Config {
     /// 兩層 merge:`~/.mori/ear.json` 提供覆寫,`~/.mori/config.json` 補洞。
     ///
     /// 過去版本是「ear.json 存在 → 整份用它,完全不 fallback」,結果只想用 ear.json
-    /// 改 hotkey 的 user(沒寫 groq_api_key 欄位)會被當成 key 沒設,啟動直接死在
-    /// 「GROQ_API_KEY 缺」 — 即使 config.json 早就有跟 mori-desktop 共用那把 key。
+    /// 改 hotkey 的 user(沒寫 groq_api_key 欄位)會被當成 key 沒設；若當時走 Groq,
+    /// 就會在啟動直接死在「GROQ_API_KEY 缺」,即使 config.json 早就有共用的 key。
     /// 改成 partial merge:ear.json 沒寫 / 空字串的 groq_api_key 自動補 config.json
     /// 的 `providers.groq.api_key`。
     fn load() -> Self {
@@ -799,7 +799,12 @@ async fn run() -> Result<ExitCode> {
             "backend=groq 但無 Groq API key — 設 GROQ_API_KEY / 寫進 ~/.mori/config.json 的 providers.groq.api_key,或把 backend 設成 auto/local"
         );
     }
-    info!(hotkey = %cfg.hotkey, backend = %cfg.backend, "mori-ear ready — 按住熱鍵說話、放開停止");
+    info!(
+        hotkey = %cfg.hotkey,
+        backend = %cfg.backend,
+        hotkey_mode = %cfg.voice_input.hotkey_mode,
+        "mori-ear ready — 語音輸入熱鍵已啟用"
+    );
 
     // 熱鍵事件的統一入口 —— 不管來源是 X11/Windows 的 global-hotkey 還是 Wayland
     // 的 portal,最後都變成 KeyEdge 從這條 channel 出來。

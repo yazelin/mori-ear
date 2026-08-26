@@ -14,13 +14,13 @@ hound = "3.5"
 reqwest = { version = "0.12", features = ["multipart", "rustls-tls", "json"], default-features = false }
 # async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
-# global hotkey(MVP:Linux X11 + Windows;Wayland 之後加 ashpd)
+# global hotkey(X11 / Windows;Linux Wayland 另走 ashpd GlobalShortcuts portal)
 global-hotkey = "0.6"
 # 對外轉譯服務的 HTTP server(GET / 驗活、POST /inference)。blocking、極小依賴,
 # 符合 ear 的極簡調性(不引 axum/hyper)。每 request 在 service thread 用 tokio Handle
 # block_on 跑 async 轉譯。
 tiny_http = "0.12"
-# paste-back:type 進焦點視窗。enigo 跨 Linux X11 / Windows / macOS,Unicode OK
+# paste-back:type 進焦點視窗。Linux/Windows 走原生 clipboard + paste,macOS fallback enigo
 enigo = "0.5"
 # 單一實例 lock(Linux 用 abstract socket、Windows 用 named mutex、macOS lock file)
 # 避免兩個 mori-ear 同時 grab 同一把熱鍵(X11 一個 client 一把 key)

@@ -557,7 +557,7 @@ section::before {
   color: inherit;
 }
 
-.tok-cmd, .tok-key, .tok-bool { color: var(--c-code-accent); font-weight: 700; }
+.tok-cmd, .tok-key, .tok-bool, .tok-num { color: var(--c-code-accent); font-weight: 700; }
 .tok-flag { color: var(--sandstone); }
 .tok-op { color: var(--c-text-dim); }
 .tok-str { color: var(--c-code-string); }

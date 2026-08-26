@@ -11,14 +11,12 @@
 //! # 為什麼是 portal 而不是 GNOME 自訂快捷鍵
 //!
 //! GNOME 自訂快捷鍵(`org.gnome.settings-daemon` custom-keybindings)只有「按下」
-//! 語意 —— 它是「按到這組鍵就執行這行指令」,拿不到放開。用它只能做成 toggle
-//! (按一下開、再按一下停),那會改掉這顆器官的核心手感:**mori-ear 只有 hold**
-//! (`KeyEdge::Pressed`/`Released` 兩個分支,原始碼裡沒有 toggle 這個概念;
-//! 可 toggle 的是 mori-desktop 的 `hotkeys.toggle_mode`,別搞混)。
+//! 語意 —— 它是「按到這組鍵就執行這行指令」,拿不到放開。它只適合 toggle
+//! (按一下開、再按一下停),但 mori-ear 的 portal 路徑同時支援 toggle 與 hold。
 //!
 //! `GlobalShortcuts` portal 是唯一同時給得起兩端的介面:`Activated` 對應按下、
-//! `Deactivated` 對應放開,一對一 map 到 [`crate::KeyEdge`],`handle_event`
-//! 的邏輯一行都不用改。
+//! `Deactivated` 對應放開,一對一 map 到 [`crate::KeyEdge`]。hold 會使用兩種
+//! edge；toggle 只消費 `Pressed`,把 `Released` 交給上層忽略。
 //!
 //! # 跟 mori-desktop 的關係
 //!
@@ -129,7 +127,7 @@ pub async fn spawn(hotkey: &str, tx: UnboundedSender<KeyEdge>) -> Result<Handle>
         .context("portal create_session 失敗")?;
 
     let trigger = to_portal_trigger(hotkey);
-    let shortcut = NewShortcut::new(SHORTCUT_ID, "mori-ear:按住講話").preferred_trigger(&*trigger);
+    let shortcut = NewShortcut::new(SHORTCUT_ID, "mori-ear:語音輸入").preferred_trigger(&*trigger);
 
     // 第一次呼叫會跳 GNOME 授權對話框(「mori-ear 想註冊 Ctrl+Alt+E」)。
     // 使用者同意後綁定持久化在 portal permissions,之後啟動都是靜默的。
@@ -151,7 +149,7 @@ pub async fn spawn(hotkey: &str, tx: UnboundedSender<KeyEdge>) -> Result<Handle>
         Some(s) => info!(
             requested = %trigger,
             actual = %s.trigger_description(),
-            "✓ Wayland portal 熱鍵已綁定(按住講話)",
+            "✓ Wayland portal 熱鍵已綁定(語音輸入)",
         ),
         None => warn!(
             requested = %trigger,
@@ -251,7 +249,7 @@ fn ensure_desktop_file() -> Result<()> {
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=mori-ear\n\
-         Comment=Mori 的耳朵 — 按住熱鍵講話,轉錄後貼進焦點視窗\n\
+         Comment=Mori 的耳朵 — 熱鍵語音輸入,轉錄後貼進焦點視窗\n\
          Exec={exe_str}\n\
          Icon=audio-input-microphone\n\
          Categories=Utility;AudioVideo;\n\

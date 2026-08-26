@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 Cargo.lock.bak
+
+# exchange workstream 標記,本機用,不進 repo(其他 mori repo 也都沒收)
+.exchange

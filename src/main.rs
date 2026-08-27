@@ -1140,8 +1140,14 @@ fn paste_back_wayland(text: &str, paste_key: &str) -> anyhow::Result<()> {
 
     // 2. ydotool 注入按鍵。它要 ydotoold 的 socket;env 沒設就用預設路徑,
     //    免得 autostart 環境(沒有 shell rc)找不到。
-    let combo =
+    // 先驗 paste_key 認得,再決定要餵哪種語法(兩版 ydotool 的參數格式不同)。
+    let keycodes =
         ydotool_keycodes(paste_key).with_context(|| format!("認不得的 paste_key: {paste_key}"))?;
+    let combo: Vec<String> = if ydotool_wants_named_keys() {
+        vec![paste_key.trim().to_lowercase()]
+    } else {
+        keycodes
+    };
     let mut yd = Command::new("ydotool");
     yd.arg("key").args(&combo);
     if std::env::var_os("YDOTOOL_SOCKET").is_none() {
@@ -1162,6 +1168,34 @@ fn paste_back_wayland(text: &str, paste_key: &str) -> anyhow::Result<()> {
 
     tracing::info!(paste_key, "paste-back via wl-copy + ydotool (Wayland)");
     Ok(())
+}
+
+/// 這台的 ydotool 要不要「名字」語法(`ctrl+v`)而不是 keycode 語法(`29:1 47:1 ...`)?
+///
+/// 為什麼要問:0.1.x(Ubuntu 24.04 的版本)只吃名字,1.x 只吃 keycode,而**餵錯版本
+/// 不會報錯** —— 實測 0.1.8 收到 `42:1 42:0` 會 exit 0 並送出 keycode 5(數字鍵 4),
+/// 也就是焦點視窗被打進一串垃圾字元、log 卻回報「貼回完成」。這是最惡劣的那種
+/// 靜默失敗,所以寧可多跑一次 `--help`。
+///
+/// 判準:0.1.x 的 `key --help` 會寫「separated by plus (+)」,1.x 沒有這句。
+/// 問不到(ydotool 不在)就當 1.x —— 新版是往後的預設。
+#[cfg(target_os = "linux")]
+fn ydotool_wants_named_keys() -> bool {
+    static NAMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NAMED.get_or_init(|| {
+        std::process::Command::new("ydotool")
+            .args(["key", "--help"])
+            .output()
+            .map(|o| {
+                let help = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                help.contains("separated by plus")
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// 把 `ctrl+shift+v` 轉成 ydotool 的 `<keycode>:<1按下|0放開>` 序列。

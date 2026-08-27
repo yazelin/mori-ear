@@ -464,7 +464,7 @@ mori-ear --serve
 |---|---|---|---|
 | **Windows** | 尚未實測 | 尚未實測 | 已有 Win32 `SetClipboardData` + `SendInput Ctrl+V` 路徑，但新的 toggle、分段轉譯與邊講邊貼流程尚未驗證，可能正常，也可能遇到問題；config 路徑 `%USERPROFILE%\.mori\` |
 | Linux **X11** | 已實測 | 已實測 | 目前新運作模式的主要驗證環境；走 `xclip` + `xdotool ctrl+v`，Terminal 自動偵測切 `ctrl+shift+v` |
-| Linux **Wayland** | 已實測(走 GNOME 快捷鍵 → `ear talk` → SIGUSR1;portal 那條在 24.04 上不存在) | 未實測 | `wl-copy` + `ydotool` 路徑寫好但沒真的貼成功過:24.04 的 `ydotool` 是 0.1.8(沒有 `ydotoold`)，而 `/dev/uinput` 預設 `root:root 0600`，要自己加 udev 規則 |
+| Linux **Wayland** | 已實測(走 GNOME 快捷鍵 → `ear talk` → SIGUSR1;portal 那條在 24.04 上不存在) | 按鍵注入已驗、整條語音→貼回未驗 | 24.04 要先開 `/dev/uinput` 權限、且 `ydotool` 0.1.x 只吃名字語法(兩個坑見下) |
 | macOS | 理論支援 | 理論支援 | 第一次跑要授權 Accessibility；paste-back 走 enigo `text()` 逐字 fallback |
 
 ### Linux Wayland 細節
@@ -475,13 +475,17 @@ mori-ear --serve
 2. X11 `XGrabKey` —— Wayland 下只有「焦點停在 X11 / XWayland 視窗」時才收得到按鍵，是這顆器官在 Wayland 上看起來完全不響的原因。
 3. **`SIGUSR1`** —— GNOME 自訂快捷鍵綁 `ear talk`(`ear install` / `ear keybind on` 會自動綁)。compositor 層，不吃 portal 也不吃 grab，1 和 2 都廢掉時就靠這條。
 
-paste-back 在 Ubuntu 24.04 上還缺一步:`ydotool` 0.1.8 沒有 `ydotoold`，直接開 `/dev/uinput`，但那顆節點預設是 `root:root 0600`。要放行:
+paste-back 在 Ubuntu 24.04 上有兩個坑。
+
+**(1) `/dev/uinput` 權限**:`ydotool` 0.1.8 沒有 `ydotoold`，自己開 `/dev/uinput`，但那顆節點預設是 `root:root 0600`，人在 `input` 群組也開不了(訊息是 `failed to open uinput device` 加 core dump)。要放行:
 
 ```sh
 echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' \
   | sudo tee /etc/udev/rules.d/99-uinput.rules
 sudo modprobe uinput && sudo udevadm control --reload && sudo udevadm trigger
 ```
+
+**(2) 兩版 ydotool 語法不同，餵錯不會報錯**:0.1.x 吃 `ydotool key ctrl+v`(名字)，1.x 吃 `ydotool key 29:1 47:1 47:0 29:0`(keycode)。實測 0.1.8 收到 keycode 語法會 **exit 0** 並送出 keycode 5(數字鍵 `4`)—— 焦點視窗被打進垃圾字元，log 卻回報「貼回完成」。所以程式會先跑一次 `ydotool key --help` 認版本(見 `ydotool_wants_named_keys`)，再挑對的語法送。
 
 **首次啟動會跳授權對話框**(「mori-ear 想註冊 Ctrl+Alt+E」)，按同意後綁定持久化，之後啟動都是靜默的。
 

@@ -446,13 +446,11 @@ mori-ear --serve
 | 環境 | hotkey | paste-back | 備註 |
 |---|---|---|---|
 | **Windows** | 尚未實測 | 尚未實測 | 已有 Win32 `SetClipboardData` + `SendInput Ctrl+V` 路徑，但新的 toggle、分段轉譯與邊講邊貼流程尚未驗證，可能正常，也可能遇到問題；config 路徑 `%USERPROFILE%\.mori\` |
-| Linux **X11** | 已實測 | 已實測 | 目前新運作模式的主要驗證環境；走 `xclip` + `xdotool ctrl+v`，Terminal 自動偵測切 `ctrl+shift+v` |
-| Linux **Wayland** | 已實測(走 GNOME 快捷鍵 → `ear talk` → SIGUSR1;portal 那條在 24.04 上不存在) | 按鍵注入已驗、整條語音→貼回未驗 | 24.04 要先開 `/dev/uinput` 權限、且 `ydotool` 0.1.x 只吃名字語法(兩個坑見下) |
+| Linux **X11** | 未實測(砍掉 XGrabKey 之後沒在真 X11 session 跑過;走的是跟 Wayland 同一條 GNOME 快捷鍵) | 已實測 | 走 `xclip` + `xdotool`，用 `xdotool getactivewindow` 偵測 terminal 自動切 `ctrl+shift+v`(X11 不讀 `paste_key`) |
+| Linux **Wayland** | 已實測(GNOME 快捷鍵 → `ear talk` → SIGUSR1) | 已實測(2026-08-27,GNOME 46 / Ubuntu 24.04) | 24.04 要先開 `/dev/uinput` 權限、且 `ydotool` 0.1.x 只吃名字語法(兩個坑見下);Wayland 查不到焦點視窗,終端機要自己設 `"paste_key": "ctrl+shift+v"` |
 | macOS | 理論支援 | 理論支援 | 第一次跑要授權 Accessibility；paste-back 走 enigo `text()` 逐字 fallback |
 
 ### Linux Wayland 細節
-
-熱鍵有三條路，由上而下 fallback:
 
 Linux 的熱鍵**只有一條路**:桌面環境的自訂快捷鍵綁 `ear talk` → `SIGUSR1`(`ear install` / `ear keybind on` 會自動綁 GNOME 那顆)。X11 / Wayland 都走這條，因為快捷鍵是 compositor 層處理的。
 

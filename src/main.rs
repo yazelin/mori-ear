@@ -865,6 +865,34 @@ async fn run() -> Result<ExitCode> {
             })
             .context("spawn hotkey bridge thread")?;
     }
+    // SIGUSR1 = 一次「按下」。存在的理由:Ubuntu 24.04 的 xdg-desktop-portal 是 1.18,
+    // 根本沒有 `org.freedesktop.portal.GlobalShortcuts` 介面(要 1.19+),所以 Wayland
+    // 下 portal 註冊必失敗、退回的 XGrabKey 又只在焦點停在 XWayland 視窗時才收得到 ——
+    // 熱鍵等於沒有。GNOME 自訂快捷鍵是 compositor 層的,綁 `pkill -USR1 -x mori-ear`
+    // 就繞過整條 portal / grab 鏈路,X11 與 Wayland 都會響。
+    //
+    // 只有「按下」語意(GNOME 快捷鍵拿不到放開),所以配 toggle 模式;hold 模式下
+    // 這條路等於「按一下開始,再按一下停」,不會有邊講邊貼以外的差別。
+    // ponytail: 用信號不用 HTTP 端點 —— 少一層 port 查找;要跨機觸發再改走 service。
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::user_defined1()) {
+            Ok(mut sig) => {
+                let tx = edge_tx.clone();
+                tokio::spawn(async move {
+                    while sig.recv().await.is_some() {
+                        info!("SIGUSR1 → 熱鍵按下(ear talk / GNOME 快捷鍵)");
+                        if tx.send(KeyEdge::Pressed).is_err() {
+                            return; // 主 loop 收工了
+                        }
+                    }
+                });
+            }
+            Err(e) => warn!(error = ?e, "SIGUSR1 handler 掛不上 —— `ear talk` 不會有反應"),
+        }
+    }
+
     // 本地 tx 留著沒用會讓 edge_rx 永遠不 close,drop 掉。
     drop(edge_tx);
 

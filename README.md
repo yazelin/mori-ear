@@ -176,7 +176,7 @@ ear install
 1. **檢查 paste-back 依賴** — 依 X11 / Wayland 分別檢查，缺什麼直接印 `apt install` 指令
 2. `cargo install --path .` 編譯 + 裝 binary
 3. `bash scripts/install-autostart.sh` 寫 XDG autostart entry
-4. `gsettings` 綁 Ctrl+Shift+Alt+E → `ear toggle`(GNOME)
+4. `gsettings` 綁 Ctrl+Alt+E → `ear talk`(GNOME)
 5. nohup 啟動 process
 
 依賴缺了**不會擋安裝**。binary、熱鍵、stdout 都還是能用，只是字貼不進焦點視窗。
@@ -185,7 +185,8 @@ ear install
 日常用：
 
 ```sh
-ear              # toggle(沒跑就開、跑就停)— 跟 Ctrl+Shift+Alt+E 同等
+ear              # toggle daemon(沒跑就開、跑就停)
+ear talk         # 送一次「熱鍵按下」給 daemon — GNOME 快捷鍵 Ctrl+Alt+E 綁的就是這個
 ear on / off     # 明確開 / 關
 ear status       # 看 process + 各層安裝狀態 + paste-back 依賴
 ear deps         # 只檢查 paste-back 依賴(自動分辨 X11 / Wayland)
@@ -204,7 +205,9 @@ paste-back 的外部依賴依 session 分兩組，`ear deps` 會自己判斷該�
 | **X11** | `xclip` + `xdotool` | — |
 | **Wayland** | `wl-clipboard` + `ydotool` | `ydotoold` 服務要在跑、使用者要在 `input` 群組(加完**必須重新登入**) |
 
-預設快捷鍵 `<Ctrl><Shift><Alt>e`，要換改 `scripts/ear.sh` 頂端 `GS_BINDING` 後重跑 `ear keybind off && ear keybind on`。
+預設快捷鍵 `<Ctrl><Alt>e` → `ear talk`(送 SIGUSR1 給 daemon = 一次「按下」)，要換改 `scripts/ear.sh` 頂端 `GS_BINDING` 後重跑 `ear keybind off && ear keybind on`。
+
+**為什麼快捷鍵綁的是 `ear talk` 而不是程式自己註冊的熱鍵**:Ubuntu 24.04 的 `xdg-desktop-portal` 是 1.18，根本沒有 `org.freedesktop.portal.GlobalShortcuts` 介面(要 1.19+，Ubuntu 26.04 才有)。Wayland 下 portal 註冊必失敗、退回的 `XGrabKey` 又只在焦點停在 XWayland 視窗時收得到 —— 熱鍵等於沒有。GNOME 自訂快捷鍵在 compositor 層，X11 / Wayland 都會響，所以拿它當通用退路。程式收到 `SIGUSR1` 就當成一次「按下」(只有按下語意，配 toggle 模式)。手動觸發:`pkill -USR1 -x mori-ear`。
 
 ---
 
@@ -461,12 +464,24 @@ mori-ear --serve
 |---|---|---|---|
 | **Windows** | 尚未實測 | 尚未實測 | 已有 Win32 `SetClipboardData` + `SendInput Ctrl+V` 路徑，但新的 toggle、分段轉譯與邊講邊貼流程尚未驗證，可能正常，也可能遇到問題；config 路徑 `%USERPROFILE%\.mori\` |
 | Linux **X11** | 已實測 | 已實測 | 目前新運作模式的主要驗證環境；走 `xclip` + `xdotool ctrl+v`，Terminal 自動偵測切 `ctrl+shift+v` |
-| Linux **Wayland** | 未實測 | 未實測 | 程式已有 `GlobalShortcuts` portal、`wl-copy` + `ydotool` 路徑，但新的運作模式不在目前實測範圍；需 `ydotoold` 在跑且使用者在 `input` 群組 |
+| Linux **Wayland** | 已實測(走 GNOME 快捷鍵 → `ear talk` → SIGUSR1;portal 那條在 24.04 上不存在) | 未實測 | `wl-copy` + `ydotool` 路徑寫好但沒真的貼成功過:24.04 的 `ydotool` 是 0.1.8(沒有 `ydotoold`)，而 `/dev/uinput` 預設 `root:root 0600`，要自己加 udev 規則 |
 | macOS | 理論支援 | 理論支援 | 第一次跑要授權 Accessibility；paste-back 走 enigo `text()` 逐字 fallback |
 
 ### Linux Wayland 細節
 
-熱鍵走 `org.freedesktop.portal.GlobalShortcuts`(GNOME 45+ / KDE Plasma 6+)，不是 X11 的 `XGrabKey`。後者在 Wayland 下只有「焦點停在 X11 視窗」時才收得到按鍵，是這顆器官在 Wayland 上曾經完全不響的原因。
+熱鍵有三條路，由上而下 fallback:
+
+1. `org.freedesktop.portal.GlobalShortcuts`(GNOME 45+ / KDE Plasma 6+)—— **要 `xdg-desktop-portal` 1.19+**。Ubuntu 24.04 是 1.18，這條路在那上面直接不存在(啟動 log 會印 `A portal frontend implementing org.freedesktop.host.portal.Registry was not found`)。
+2. X11 `XGrabKey` —— Wayland 下只有「焦點停在 X11 / XWayland 視窗」時才收得到按鍵，是這顆器官在 Wayland 上看起來完全不響的原因。
+3. **`SIGUSR1`** —— GNOME 自訂快捷鍵綁 `ear talk`(`ear install` / `ear keybind on` 會自動綁)。compositor 層，不吃 portal 也不吃 grab，1 和 2 都廢掉時就靠這條。
+
+paste-back 在 Ubuntu 24.04 上還缺一步:`ydotool` 0.1.8 沒有 `ydotoold`，直接開 `/dev/uinput`，但那顆節點預設是 `root:root 0600`。要放行:
+
+```sh
+echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' \
+  | sudo tee /etc/udev/rules.d/99-uinput.rules
+sudo modprobe uinput && sudo udevadm control --reload && sudo udevadm trigger
+```
 
 **首次啟動會跳授權對話框**(「mori-ear 想註冊 Ctrl+Alt+E」)，按同意後綁定持久化，之後啟動都是靜默的。
 

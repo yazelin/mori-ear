@@ -10,13 +10,14 @@
 #   ear on           # 啟動
 #   ear off          # 停掉
 #   ear toggle       # 同上
+#   ear talk         # 送一次「熱鍵按下」給 daemon(GNOME 快捷鍵綁的就是這個)
 #   ear status       # 看在不在跑、binary 時間、各層安裝狀態、paste-back 依賴
 #   ear deps         # 只檢查 paste-back 外部依賴(依 X11 / Wayland 分別檢查)
 #   ear log          # tail 最近 log
 #   ear install      # 一鍵全套裝(依賴檢查 + binary + autostart + GNOME 快捷鍵 + 啟動)
 #   ear uninstall    # 一鍵反過來全套拆(會問你確認;--yes 跳過)
 #   ear autostart on|off  # 只開/關 開機自動啟用(不動 binary 跟快捷鍵)
-#   ear keybind on|off    # 只綁/解 GNOME Ctrl+Shift+Alt+E 快捷鍵
+#   ear keybind on|off    # 只綁/解 GNOME Ctrl+Alt+E 快捷鍵(→ ear talk)
 #   ear help         # 印這段
 #
 # 設計:四層彼此獨立,各層可單獨開關。`install` / `uninstall` 是便利包裝。
@@ -80,7 +81,11 @@ PORTAL_DESKTOP="$HOME/.local/share/applications/$PORTAL_APP_ID.desktop"
 
 GS_SCHEMA="org.gnome.settings-daemon.plugins.media-keys"
 GS_KEY_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/mori-ear-toggle/"
-GS_BINDING='<Ctrl><Shift><Alt>e'
+# 快捷鍵綁的是 `ear talk`(送 SIGUSR1 給跑著的 daemon = 一次「按下」),不是 daemon 開關。
+# 為什麼:24.04 的 xdg-desktop-portal 1.18 沒有 GlobalShortcuts 介面,Wayland 下 mori-ear
+# 自己註冊的熱鍵註定收不到按鍵(見 src/main.rs 的 SIGUSR1 段)。GNOME 快捷鍵在 compositor
+# 層,X11 / Wayland 都會響。
+GS_BINDING='<Ctrl><Alt>e'
 
 notify() {
     if command -v notify-send >/dev/null 2>&1; then
@@ -129,6 +134,16 @@ cmd_off() {
 
 cmd_toggle() {
     if is_running; then cmd_off; else cmd_on; fi
+}
+
+# talk — 送一次「熱鍵按下」給跑著的 daemon(toggle 模式下:開始講 / 停止)。
+# daemon 沒在跑就先拉起來,免得按了快捷鍵毫無反應還要自己去想為什麼。
+cmd_talk() {
+    if ! is_running; then
+        cmd_on || return 1
+        sleep 1   # 等它把 SIGUSR1 handler 掛上,不然這一按會被當成預設的「終止」
+    fi
+    pkill -USR1 -x mori-ear
 }
 
 binary_installed()    { [[ -x "$BIN" ]]; }
@@ -227,7 +242,7 @@ cmd_status() {
         echo "  autostart: ✗ off"
     fi
     if keybind_installed; then
-        echo "  keybind:   ✓ Ctrl+Shift+Alt+E"
+        echo "  keybind:   ✓ $GS_BINDING → ear talk"
     else
         echo "  keybind:   ✗ not bound"
     fi
@@ -293,10 +308,10 @@ cmd_keybind() {
             local new_list
             new_list=$(_modify_keybindings_list add "$GS_KEY_PATH") || return 1
             gsettings set $GS_SCHEMA custom-keybindings "$new_list"
-            gsettings set ${GS_SCHEMA}.custom-keybinding:$GS_KEY_PATH name 'mori-ear toggle'
-            gsettings set ${GS_SCHEMA}.custom-keybinding:$GS_KEY_PATH command "$invoke_path toggle"
+            gsettings set ${GS_SCHEMA}.custom-keybinding:$GS_KEY_PATH name 'mori-ear talk'
+            gsettings set ${GS_SCHEMA}.custom-keybinding:$GS_KEY_PATH command "$invoke_path talk"
             gsettings set ${GS_SCHEMA}.custom-keybinding:$GS_KEY_PATH binding "$GS_BINDING"
-            echo "✓ GNOME 快捷鍵 Ctrl+Shift+Alt+E → $invoke_path toggle"
+            echo "✓ GNOME 快捷鍵 $GS_BINDING → $invoke_path talk"
             ;;
         off)
             local new_list
@@ -381,7 +396,7 @@ cmd_install() {
 cmd_uninstall() {
     echo "這會移除:"
     [[ -n "$(pgrep -x mori-ear)" ]] && echo "  • 跑中的 mori-ear process"
-    keybind_installed     && echo "  • GNOME 快捷鍵 Ctrl+Shift+Alt+E"
+    keybind_installed     && echo "  • GNOME 快捷鍵 $GS_BINDING"
     autostart_installed   && echo "  • 開機自動啟動 $AUTOSTART_DESKTOP"
     binary_installed      && echo "  • binary $BIN"
     [[ -f "$PORTAL_DESKTOP" ]] && echo "  • Wayland portal desktop entry $PORTAL_DESKTOP"
@@ -469,6 +484,7 @@ case "${1:-toggle}" in
     on|start)         cmd_on ;;
     off|stop)         cmd_off ;;
     toggle|"")        cmd_toggle ;;
+    talk)             cmd_talk ;;
     status|st)        cmd_status ;;
     deps|dep)         check_deps ;;
     log|logs)         cmd_log ;;

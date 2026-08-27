@@ -98,7 +98,7 @@ tarball 內含 `mori-ear` binary + `ear.sh` + `install-autostart.sh`，不需要
 export GROQ_API_KEY=gsk_xxxxx
 
 #    paste-back 依賴 —— 依你的 session 裝其中一組(不確定就跑 ./ear.sh deps 問它)
-#    另外選用:sudo apt install yad —— hold 模式的懸浮預覽 / 長句編輯視窗
+#    另外選用:sudo apt install yad —— 關掉 live_paste 時的懸浮預覽 / 長句編輯視窗
 #    (缺了只是沒有那個視窗,轉錄與貼回照常)
 sudo apt install xclip xdotool                 # X11
 sudo apt install wl-clipboard ydotool          # Wayland
@@ -207,7 +207,7 @@ paste-back 的外部依賴依 session 分兩組，`ear deps` 會自己判斷該�
 
 預設快捷鍵 `<Ctrl><Alt>e` → `ear talk`(送 SIGUSR1 給 daemon = 一次「按下」)，要換改 `scripts/ear.sh` 頂端 `GS_BINDING` 後重跑 `ear keybind off && ear keybind on`。
 
-**為什麼快捷鍵綁的是 `ear talk` 而不是程式自己註冊的熱鍵**:Ubuntu 24.04 的 `xdg-desktop-portal` 是 1.18，根本沒有 `org.freedesktop.portal.GlobalShortcuts` 介面(要 1.19+，Ubuntu 26.04 才有)。Wayland 下 portal 註冊必失敗、退回的 `XGrabKey` 又只在焦點停在 XWayland 視窗時收得到 —— 熱鍵等於沒有。GNOME 自訂快捷鍵在 compositor 層，X11 / Wayland 都會響，所以拿它當通用退路。程式收到 `SIGUSR1` 就當成一次「按下」(只有按下語意，配 toggle 模式)。手動觸發:`pkill -USR1 -x mori-ear`。
+**Linux 的熱鍵就只有這條**:程式自己註冊全域熱鍵的兩條路(Wayland 的 GlobalShortcuts portal、X11 的 XGrabKey)在 2026-08-27 都拿掉了 —— 前者要 `xdg-desktop-portal` 1.19+(Ubuntu 24.04 是 1.18，介面不存在)，後者在 Wayland 下只有焦點停在 XWayland 視窗時才收得到、回 X11 又會跟桌面快捷鍵搶同一組鍵。桌面環境的自訂快捷鍵在 compositor 層，X11 / Wayland 都會響，一條就夠。程式收到 `SIGUSR1` 就當成一次「按下」。手動觸發:`pkill -USR1 -x mori-ear`。
 
 ---
 
@@ -261,7 +261,7 @@ gsettings reset org.gnome.settings-daemon.plugins.media-keys custom-keybindings 
 
 ## 使用
 
-### toggle 模式(預設)
+### 講話 → 出字
 
 ```
 按一下 Ctrl+Alt+E   → 開始錄音
@@ -272,30 +272,15 @@ gsettings reset org.gnome.settings-daemon.plugins.media-keys custom-keybindings 
 字在你還在講的時候就一段一段出現在游標處，要改直接用鍵盤改。它就落在你原本要打字的地方。
 忘記按第二下也不會一直錄下去，`toggle_max_secs`(預設 120 秒)會自己收尾。
 
-### hold 模式(`voice_input.hotkey_mode: "hold"`)
+### 熱鍵只有 toggle 一種
 
-```
-按住 Ctrl+Alt+E     → 開始錄音
-講話                 → 每次停頓,那一段就先轉譯掉(但先不貼)
-放開                 → 只剩尾巴要等,然後整句一起貼
-```
+按住講話、放開停(hold)在 2026-08-27 拿掉了。Linux 的熱鍵來源是桌面環境的自訂快捷鍵，
+那個介面只給得起「按下」，給不了「放開」，所以 hold 在 Linux 根本做不出來。與其留一個
+在主力平台上不能用的模式，不如定死成 toggle。舊 config 裡的 `hotkey_mode` 會被忽略。
 
-**hold 不能邊講邊貼**。原因是 X11 的 active keyboard grab：按住熱鍵時，
-mori-ear 注入的 `Ctrl+V` 到不了焦點視窗。實測過，三段都回報「貼回完成」，只有放開之後那一段
-真的落地。所以 hold 改用**懸浮視窗**顯示進度，長句再跳編輯視窗讓你先改再送。
-
-### 兩種模式對照
-
-| | toggle(預設) | hold |
-|---|---|---|
-| 開始 / 停止 | 按一下 / 再按一下 | 按住 / 放開 |
-| 分段轉譯 | 支援 | 支援 |
-| 邊講邊貼到游標處 | 支援 | 不支援(鍵盤 grab) |
-| 懸浮預覽視窗 | 自動關(字已經在游標處) | 自動開(需 `yad`) |
-| 長句(>`preview_confirm_chars`) | 不特別處理，直接在游標處改 | 跳多行編輯視窗，**滑鼠點送出、Enter 是換行** |
-| 忘記結束 | `toggle_max_secs` 自動收尾 | 放開就結束，不會發生 |
-
-`preview_enabled` 與 `live_paste` 不設的話會**跟著 `hotkey_mode` 自動配好**，不用自己組。
+`live_paste` 與 `preview_enabled` 不設的話:邊講邊貼開著、懸浮視窗關著(字已經出現在
+游標處，再開一個視窗只是重複顯示)。把 `live_paste` 設成 `false` 就回到「停止後整段送出」，
+懸浮視窗與長句編輯視窗這時才有意義。
 
 ### 輸出
 
@@ -336,7 +321,6 @@ Whisper 對安靜的音訊會幻覺出「謝謝」「請訂閱」「祝你生日
     "port": 0
   },
   "voice_input": {
-    "hotkey_mode": "toggle",
     "toggle_max_secs": 120,
 
     "stream_chunks_enabled": true,
@@ -350,7 +334,7 @@ Whisper 對安靜的音訊會幻覺出「謝謝」「請訂閱」「祝你生日
 }
 ```
 
-`voice_input` 底下還有三個**不寫就跟著 `hotkey_mode` 自動配好**的欄位，列在下面的表裡：
+`voice_input` 底下還有三個**不寫就自動配好**的欄位，列在下面的表裡：
 `live_paste`、`preview_enabled`、`preview_confirm_chars`。
 
 - `hotkey`:`Ctrl+Alt+E` / `Ctrl+Shift+V` / `Ctrl+Alt+Y` 等。被別的程式佔走會 register 失敗 — 換一組。
@@ -372,8 +356,7 @@ Whisper 對安靜的音訊會幻覺出「謝謝」「請訂閱」「祝你生日
 
 | 欄位 | 預設 | 說明 |
 |---|---|---|
-| `hotkey_mode` | `"toggle"` | `toggle` 按一下開始、再按一下停；`hold` 按住講話、放開停。預設 toggle 是為了跟 mori-desktop 的語音按鈕一致 |
-| `toggle_max_secs` | `120` | toggle 錄超過這麼久自動收尾(忘記按第二下的保險)。`0` = 不設限 |
+| `toggle_max_secs` | `120` | 錄超過這麼久自動收尾(忘記按第二下的保險)。`0` = 不設限 |
 
 **講到一半就先轉譯**
 
@@ -385,11 +368,11 @@ Whisper 對安靜的音訊會幻覺出「謝謝」「請訂閱」「祝你生日
 
 開了分段之後 cleanup 會變成**逐段做**，接縫的標點會比整句一起做差一點。換到的是等待變短。
 
-**輸出與預覽**(這三個不寫就跟著 `hotkey_mode` 走)
+**輸出與預覽**
 
 | 欄位 | 不寫時 | 說明 |
 |---|---|---|
-| `live_paste` | toggle → `true`，hold → `false` | 每段轉完直接貼到游標處。**只有 toggle 能用**，hold 會被鍵盤 grab 擋掉(見「使用」) |
+| `live_paste` | `true` | 每段轉完直接貼到游標處 |
 | `preview_enabled` | 邊講邊貼時 `false`,否則 `true` | 懸浮視窗顯示即時進度。需要 `yad`,沒裝就自動關掉、轉錄照跑 |
 | `preview_confirm_chars` | `150` | 超過這個字數跳多行編輯視窗讓你先改再送。邊講邊貼時不生效(字都出去了)。設 `0` = 每一句都問 |
 
@@ -471,9 +454,12 @@ mori-ear --serve
 
 熱鍵有三條路，由上而下 fallback:
 
-1. `org.freedesktop.portal.GlobalShortcuts`(GNOME 45+ / KDE Plasma 6+)—— **要 `xdg-desktop-portal` 1.19+**。Ubuntu 24.04 是 1.18，這條路在那上面直接不存在(啟動 log 會印 `A portal frontend implementing org.freedesktop.host.portal.Registry was not found`)。
-2. X11 `XGrabKey` —— Wayland 下只有「焦點停在 X11 / XWayland 視窗」時才收得到按鍵，是這顆器官在 Wayland 上看起來完全不響的原因。
-3. **`SIGUSR1`** —— GNOME 自訂快捷鍵綁 `ear talk`(`ear install` / `ear keybind on` 會自動綁)。compositor 層，不吃 portal 也不吃 grab，1 和 2 都廢掉時就靠這條。
+Linux 的熱鍵**只有一條路**:桌面環境的自訂快捷鍵綁 `ear talk` → `SIGUSR1`(`ear install` / `ear keybind on` 會自動綁 GNOME 那顆)。X11 / Wayland 都走這條，因為快捷鍵是 compositor 層處理的。
+
+原本另外兩條在 2026-08-27 砍掉了:
+
+- `org.freedesktop.portal.GlobalShortcuts` —— 要 `xdg-desktop-portal` 1.19+，Ubuntu 24.04 是 1.18，那顆介面在上面根本不存在;而在有它的系統上，桌面快捷鍵這條一樣會動，重複。連帶把 `ashpd` 依賴一起拿掉。
+- X11 `XGrabKey`(`global-hotkey` crate)—— Wayland 下只有焦點停在 XWayland 視窗時才收得到按鍵;回 X11 又會跟桌面環境已綁的同一組鍵互搶。`global-hotkey` 現在只編進 Windows / macOS。
 
 paste-back 在 Ubuntu 24.04 上有兩個坑。
 
@@ -487,14 +473,11 @@ sudo modprobe uinput && sudo udevadm control --reload && sudo udevadm trigger
 
 **(2) 兩版 ydotool 語法不同，餵錯不會報錯**:0.1.x 吃 `ydotool key ctrl+v`(名字)，1.x 吃 `ydotool key 29:1 47:1 47:0 29:0`(keycode)。實測 0.1.8 收到 keycode 語法會 **exit 0** 並送出 keycode 5(數字鍵 `4`)—— 焦點視窗被打進垃圾字元，log 卻回報「貼回完成」。所以程式會先跑一次 `ydotool key --help` 認版本(見 `ydotool_wants_named_keys`)，再挑對的語法送。
 
-**首次啟動會跳授權對話框**(「mori-ear 想註冊 Ctrl+Alt+E」)，按同意後綁定持久化，之後啟動都是靜默的。
-
 幾個要知道的：
 
-- **改 `hotkey` 不會自動生效**。portal 規範：使用者同意過之後，實際綁定由 compositor 保管。要改鍵去「設定 → 鍵盤 → 檢視及自訂快捷鍵」，或刪掉 `~/.local/share/xdg-desktop-portal/permissions` 讓 mori-ear 重新註冊。啟動時 log 會印 `actual=` 顯示**實際**綁到什麼，按了沒反應先看那行。
+- **`~/.mori/ear.json` 的 `hotkey` 欄位在 Linux 沒有作用**。實際綁哪一組鍵由桌面環境決定 —— 改 `scripts/ear.sh` 頂端的 `GS_BINDING` 再 `ear keybind off && ear keybind on`，或直接去「設定 → 鍵盤 → 檢視及自訂快捷鍵」改。
 - **偵測不到 terminal**。Wayland 不讓 client 查焦點視窗，所以自動 Ctrl+V / Ctrl+Shift+V 切換在這裡失效。terminal 使用者請設 `paste_key`。
-- **paste-back 需要 `ydotoold`**。`wl-copy` 寫 clipboard、`ydotool` 透過 `/dev/uinput` 造虛擬鍵盤注入按鍵(所以任何視窗都吃)。daemon 沒跑或使用者不在 `input` 群組就會失敗，失敗時自動退回 XWayland 那條(`xclip`+`xdotool`，只對 X11 視窗有效)。
-- **portal 不可用時**(舊桌面環境 / 沒裝 `xdg-desktop-portal-gnome`)自動 fallback 回 X11 熱鍵，log 會 WARN 說明。
+- **paste-back 靠 `ydotool`**。`wl-copy` 寫 clipboard、`ydotool` 透過 `/dev/uinput` 造虛擬鍵盤注入按鍵(所以任何視窗都吃)。`/dev/uinput` 開不了或 `ydotoold`(1.x 才有)沒跑就會失敗，失敗時自動退回 XWayland 那條(`xclip`+`xdotool`，只對 X11 視窗有效)。
 
 範例 pipe(轉錄寫到剪貼簿 + 自己 echo):
 
@@ -520,7 +503,7 @@ mori-ear 是 Mori 宇宙的「**第一個器官**」— 從 mori-desktop(身體)
 
 ## 不做(故意)
 
-- 沒 GUI / tray icon。**一個刻意的例外**是 hold 模式的懸浮預覽與長句編輯視窗
+- 沒 GUI / tray icon。**一個刻意的例外**是關掉 `live_paste` 時的懸浮預覽與長句編輯視窗
   (`src/preview.rs`)。它 spawn `yad`，跟 paste-back spawn `xclip` / `xdotool` 同一個模式：
   沒有繪圖程式碼、沒有 toolkit 相依、沒有活過一句話的視窗。缺 `yad` 就整個功能關掉，
   轉錄不受影響。這項功能借助外部工具顯示一段暫時的文字。

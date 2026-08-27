@@ -12,17 +12,18 @@
 //!   全域熱鍵(toggle 按下) → 開麥克風錄音 → 停頓時分段送 STT
 //!   再按一下 → 收尾最後一段 → 可選 cleanup → 印 stdout 並貼回焦點視窗
 //!
-//! 也支援 hold 模式(按住錄、放開停)、`--input <wav>` 批次轉譯,以及
-//! `--serve` loopback HTTP service。`backend=auto` 先找本機 whisper-server,
+//! 熱鍵只有 toggle 一種行為(2026-08-27 定案):Linux 的熱鍵來源是桌面環境的
+//! 自訂快捷鍵,只給得起「按下」,hold(按住錄、放開停)因此拿掉了。
+//! 另有 `--input <wav>` 批次轉譯與 `--serve` loopback HTTP service。`backend=auto` 先找本機 whisper-server,
 //! 不可用才 fallback Groq；`raw` 或沒有 cleanup key 時會保留原始 STT。
 //!
 //! 不做(故意):
-//!   - 沒內建 GUI / tray(hold 預覽使用可選的外部 `yad`)
+//!   - 沒內建 GUI / tray(預覽視窗是可選的外部 `yad`)
 //!   - 沒 voice profile / 校正詞庫
 //!
-//! 熱鍵有兩條來源,都收斂成同一個 [`KeyEdge`] 餵給 `handle_event`:
-//!   - X11 / Windows:`global-hotkey` crate(見 `spawn_hotkey_thread`)
-//!   - Wayland:`GlobalShortcuts` portal(見 `wayland_hotkey`)
+//! 熱鍵來源分兩邊,都收斂成同一條 channel 餵給 `handle_event`:
+//!   - Linux:桌面環境快捷鍵綁 `ear talk` → SIGUSR1(見 `run()`)
+//!   - Windows / macOS:`global-hotkey` crate(見 `spawn_hotkey_thread`)
 //!
 //! 這是「身體 + 器官」拆分的第一個器官 — mori-desktop 重啟它不重啟,
 //! user 永遠有路講話。
@@ -32,6 +33,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+// Linux 不用 global-hotkey:X11 grab 在 Wayland 下形同虛設,回 X11 又會跟桌面
+// 環境的快捷鍵搶同一組鍵。Linux 一律走 SIGUSR1(見 run() 裡的註解)。
+#[cfg(not(target_os = "linux"))]
 use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
@@ -49,30 +53,8 @@ mod service;
 mod stt;
 mod stt_prompt;
 mod watchdog;
-#[cfg(target_os = "linux")]
-mod wayland_hotkey;
 
 const DEFAULT_HOTKEY: &str = "Ctrl+Alt+E";
-
-/// 熱鍵的一次邊緣事件 —— hold 用按下/放開,toggle 只消費按下事件。
-///
-/// 存在的理由是**解耦事件來源**:X11/Windows 走 `global-hotkey` 的
-/// [`HotKeyState`],Wayland 走 portal 的 Activated/Deactivated,兩邊收斂成
-/// 同一個型別餵給 [`handle_event`],錄音邏輯就不必知道自己跑在哪個顯示協定上。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KeyEdge {
-    Pressed,
-    Released,
-}
-
-impl From<HotKeyState> for KeyEdge {
-    fn from(s: HotKeyState) -> Self {
-        match s {
-            HotKeyState::Pressed => KeyEdge::Pressed,
-            HotKeyState::Released => KeyEdge::Released,
-        }
-    }
-}
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -180,10 +162,10 @@ struct VoiceInputConfig {
     /// 一段至少要累積這麼久才准切(預設 1500),避免切出碎片害 Whisper 認不準。
     #[serde(default = "default_stream_min_segment_ms")]
     stream_min_segment_ms: u32,
-    /// hold 模式開一個懸浮視窗即時顯示目前解出的文字。需要 `yad`。
+    /// 開一個懸浮視窗即時顯示目前解出的文字。需要 `yad`。
     ///
-    /// **不設的話跟著 `hotkey_mode` 走**:hold 開、toggle 關。
-    /// toggle 是邊講邊貼,字直接出現在游標處,再多一個懸浮視窗只是重複顯示。
+    /// **不設的話跟著 `live_paste` 反向走**:邊講邊貼時字直接出現在游標處,
+    /// 再多一個懸浮視窗只是重複顯示,所以預設關;關掉邊講邊貼才預設開。
     ///
     /// 這是 CLAUDE.md「不加 GUI」那條規則的**明確例外**(2026-08-26 yazelin 拍板):
     /// 語音輸入看不到進度會沒安全感。實作上仍然沒把 GUI 寫進 mori-ear —— 跟
@@ -191,36 +173,18 @@ struct VoiceInputConfig {
     #[serde(default)]
     preview_enabled: Option<bool>,
     /// 轉出來的字超過這個數量,就跳多行編輯視窗讓你先改再送(預設 150)。
-    /// 只在 hold 模式有意義 —— toggle 是邊講邊貼,要改直接在游標處改。
+    /// 只在關掉 `live_paste` 時有意義 —— 邊講邊貼的話,要改直接在游標處改。
     #[serde(default = "default_preview_confirm_chars")]
     preview_confirm_chars: usize,
-    /// 熱鍵行為:`toggle`(預設,按一下開始、再按一下停)或 `hold`(按住講話、放開停)。
-    ///
-    /// 預設 toggle 是為了跟 mori-desktop 的按鈕一致(它也是 toggle),而且 toggle
-    /// 期間沒有按鍵被按住,才做得到邊講邊貼。
-    ///
-    /// toggle 的好處是講話期間沒有按鍵被按住 —— hold 模式下 X11 會因為 XGrabKey
-    /// 攔掉我們注入的 Ctrl+V,所以不可能邊講邊貼;toggle 沒這個限制。
-    /// 代價是忘記按第二下會一直錄,所以有 `toggle_max_secs` 兜底。
-    #[serde(default = "default_hotkey_mode")]
-    hotkey_mode: String,
-    /// toggle 模式下錄超過這麼久就自動停(預設 120 秒)。設 0 = 不自動停。
+    /// 錄超過這麼久就自動停(預設 120 秒),兜住「忘記按第二下」。設 0 = 不自動停。
     #[serde(default = "default_toggle_max_secs")]
     toggle_max_secs: u64,
-    /// 每段轉完就直接貼到游標位。**只有 toggle 模式能用**,不設的話 toggle 自動開啟。
-    ///
-    /// hold 模式下不可能:按住熱鍵時 X11 的 XGrabKey 會攔掉我們注入的 Ctrl+V,
-    /// 實測三段都回報「貼回完成」但只有放開後那段真的落地。toggle 期間沒有按鍵
-    /// 被按住,所以沒這個問題。
+    /// 每段轉完就直接貼到游標位。不設就是開。
     ///
     /// 跟 `preview_confirm_chars` 互斥:字都邊講邊貼出去了,就沒有「先給你確認」
     /// 這回事。開了這個,長句確認視窗不會出現。
     #[serde(default)]
     live_paste: Option<bool>,
-}
-
-fn default_hotkey_mode() -> String {
-    "toggle".to_string()
 }
 
 fn default_toggle_max_secs() -> u64 {
@@ -266,7 +230,6 @@ impl Default for VoiceInputConfig {
             stream_min_segment_ms: default_stream_min_segment_ms(),
             preview_enabled: None,
             preview_confirm_chars: default_preview_confirm_chars(),
-            hotkey_mode: default_hotkey_mode(),
             toggle_max_secs: default_toggle_max_secs(),
             live_paste: None,
         }
@@ -404,11 +367,20 @@ fn ear_config_path() -> std::path::PathBuf {
     home_dir().join(".mori").join("ear.json")
 }
 
+/// 這個 session 是不是 Wayland。只影響 paste-back 要走 wl-copy+ydotool 還是
+/// xclip+xdotool —— 熱鍵已經不分 session(都靠桌面環境快捷鍵送 SIGUSR1)。
+#[cfg(target_os = "linux")]
+fn is_wayland() -> bool {
+    std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"))
+        || std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty())
+}
+
 fn mori_config_path() -> std::path::PathBuf {
     home_dir().join(".mori").join("config.json")
 }
 
 /// 解析 "Ctrl+Alt+E" 為 (Modifiers, Code)。
+#[cfg(not(target_os = "linux"))]
 fn parse_hotkey(s: &str) -> Result<HotKey> {
     let mut mods = Modifiers::empty();
     let mut code: Option<Code> = None;
@@ -428,6 +400,7 @@ fn parse_hotkey(s: &str) -> Result<HotKey> {
     Ok(HotKey::new(Some(mods), code))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn key_to_code(k: &str) -> Option<Code> {
     Some(match k {
         "a" => Code::KeyA,
@@ -482,6 +455,7 @@ fn attach_parent_console_if_any() {
 ///
 /// 這條 thread 持有 manager 一直活下去(drop 會 DestroyWindow,所有 hotkey 失效),
 /// 然後在裡面跑 GetMessage loop。註冊結果用 sync mpsc 同步回主 thread,失敗就 propagate。
+#[cfg(not(target_os = "linux"))]
 fn spawn_hotkey_thread(hotkey: HotKey, hotkey_label: String) -> Result<()> {
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<()>>();
     std::thread::Builder::new()
@@ -802,77 +776,29 @@ async fn run() -> Result<ExitCode> {
     info!(
         hotkey = %cfg.hotkey,
         backend = %cfg.backend,
-        hotkey_mode = %cfg.voice_input.hotkey_mode,
         "mori-ear ready — 語音輸入熱鍵已啟用"
     );
 
-    // 熱鍵事件的統一入口 —— 不管來源是 X11/Windows 的 global-hotkey 還是 Wayland
-    // 的 portal,最後都變成 KeyEdge 從這條 channel 出來。
-    let (edge_tx, mut edge_rx) = tokio::sync::mpsc::unbounded_channel::<KeyEdge>();
+    // 熱鍵事件的統一入口。只送「按下」—— 熱鍵是 toggle:按一下開始、再按一下停,
+    // 放開不代表任何事,所以事件不必帶方向。
+    let (edge_tx, mut edge_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
-    // Wayland:先試 portal。成功就完全不碰 X11 —— XGrabKey 在 Wayland 下註冊會
-    // 「成功」但永遠收不到事件,兩條並行只會製造混淆。
-    // `_portal` 要 hold 到 run() 結束:drop 掉 session,綁定就沒了。
-    #[cfg(target_os = "linux")]
-    let _portal = if wayland_hotkey::is_wayland() {
-        match wayland_hotkey::spawn(&cfg.hotkey, edge_tx.clone()).await {
-            Ok(h) => Some(h),
-            Err(e) => {
-                warn!(
-                    error = ?e,
-                    "Wayland portal 熱鍵註冊失敗 —— fallback 回 X11(XGrabKey)。\
-                     這條路只有在焦點停在 X11 / XWayland 視窗時才收得到按鍵"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    #[cfg(target_os = "linux")]
-    let use_x11_hotkey = _portal.is_none();
-    #[cfg(not(target_os = "linux"))]
-    let use_x11_hotkey = true;
-
-    if use_x11_hotkey {
-        let hotkey =
-            parse_hotkey(&cfg.hotkey).with_context(|| format!("parse hotkey: {}", cfg.hotkey))?;
-        // global-hotkey 0.6 在 Windows 上把 RegisterHotKey 綁到 hidden window,WM_HOTKEY
-        // 進 thread queue 後**需要那條 thread 自己 pump message** WindowProc 才會被呼叫。
-        // tokio runtime 的 worker thread 不 pump Win32 message;直接在 main 建 manager
-        // 會 register 成功但 event 永遠收不到。
-        // 解法:Windows 上專開一條 OS thread 建 manager + register + 跑 GetMessage loop。
-        // Linux X11 crate 自己 spawn event thread,不受影響,維持原本 main thread 路徑即可。
-        spawn_hotkey_thread(hotkey, cfg.hotkey.clone())?;
-
-        // global-hotkey 的 receiver 是同步 crossbeam channel,沒有 async 介面。
-        // 拿一條 blocking thread 把它抽乾、轉成 KeyEdge 推進統一 channel,
-        // 主 loop 就只要 await 一個來源。50ms 的 poll 間隔沿用原本的節奏
-        // (熱鍵是人手速度,這個延遲感覺不出來)。
-        let tx = edge_tx.clone();
-        std::thread::Builder::new()
-            .name("mori-ear-hotkey-bridge".into())
-            .spawn(move || {
-                let rx = GlobalHotKeyEvent::receiver();
-                loop {
-                    while let Ok(ev) = rx.try_recv() {
-                        if tx.send(KeyEdge::from(ev.state)).is_err() {
-                            return; // 主 loop 收工了
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            })
-            .context("spawn hotkey bridge thread")?;
-    }
+    // Linux 的熱鍵**只有**這條:桌面環境的自訂快捷鍵綁 `ear talk` → SIGUSR1。
+    //
+    // 砍掉另外兩條的理由:
+    //   - `GlobalShortcuts` portal 要 xdg-desktop-portal 1.19+,Ubuntu 24.04 是 1.18,
+    //     那顆介面根本不存在;而在有它的系統上,桌面快捷鍵這條一樣會動,重複。
+    //   - X11 `XGrabKey` 在 Wayland 下只有焦點停在 XWayland 視窗時才收得到,
+    //     回 X11 又會跟桌面環境已綁的同一組鍵互搶。
+    //
+    // 代價:桌面快捷鍵只有「按下」語意,所以 Linux 只支援 toggle 模式。
     // SIGUSR1 = 一次「按下」。存在的理由:Ubuntu 24.04 的 xdg-desktop-portal 是 1.18,
     // 根本沒有 `org.freedesktop.portal.GlobalShortcuts` 介面(要 1.19+),所以 Wayland
     // 下 portal 註冊必失敗、退回的 XGrabKey 又只在焦點停在 XWayland 視窗時才收得到 ——
     // 熱鍵等於沒有。GNOME 自訂快捷鍵是 compositor 層的,綁 `pkill -USR1 -x mori-ear`
     // 就繞過整條 portal / grab 鏈路,X11 與 Wayland 都會響。
     //
-    // 只有「按下」語意(GNOME 快捷鍵拿不到放開),所以配 toggle 模式;hold 模式下
-    // 這條路等於「按一下開始,再按一下停」,不會有邊講邊貼以外的差別。
+    // 桌面快捷鍵只給得起「按下」,所以 mori-ear 的熱鍵行為就定死成 toggle。
     // ponytail: 用信號不用 HTTP 端點 —— 少一層 port 查找;要跨機觸發再改走 service。
     #[cfg(unix)]
     {
@@ -883,7 +809,7 @@ async fn run() -> Result<ExitCode> {
                 tokio::spawn(async move {
                     while sig.recv().await.is_some() {
                         info!("SIGUSR1 → 熱鍵按下(ear talk / GNOME 快捷鍵)");
-                        if tx.send(KeyEdge::Pressed).is_err() {
+                        if tx.send(()).is_err() {
                             return; // 主 loop 收工了
                         }
                     }
@@ -891,6 +817,40 @@ async fn run() -> Result<ExitCode> {
             }
             Err(e) => warn!(error = ?e, "SIGUSR1 handler 掛不上 —— `ear talk` 不會有反應"),
         }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let hotkey =
+            parse_hotkey(&cfg.hotkey).with_context(|| format!("parse hotkey: {}", cfg.hotkey))?;
+        // global-hotkey 0.6 在 Windows 上把 RegisterHotKey 綁到 hidden window,WM_HOTKEY
+        // 進 thread queue 後**需要那條 thread 自己 pump message** WindowProc 才會被呼叫。
+        // tokio runtime 的 worker thread 不 pump Win32 message;直接在 main 建 manager
+        // 會 register 成功但 event 永遠收不到。
+        spawn_hotkey_thread(hotkey, cfg.hotkey.clone())?;
+
+        // global-hotkey 的 receiver 是同步 crossbeam channel,沒有 async 介面。
+        // 拿一條 blocking thread 把它抽乾、轉成 KeyEdge 推進統一 channel,
+        // 主 loop 就只要 await 一個來源。
+        let tx = edge_tx.clone();
+        std::thread::Builder::new()
+            .name("mori-ear-hotkey-bridge".into())
+            .spawn(move || {
+                let rx = GlobalHotKeyEvent::receiver();
+                loop {
+                    while let Ok(ev) = rx.try_recv() {
+                        // 只認按下 —— 放開在 toggle 模式沒有意義
+                        if ev.state != HotKeyState::Pressed {
+                            continue;
+                        }
+                        if tx.send(()).is_err() {
+                            return; // 主 loop 收工了
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+            .context("spawn hotkey bridge thread")?;
     }
 
     // 本地 tx 留著沒用會讓 edge_rx 永遠不 close,drop 掉。
@@ -934,21 +894,13 @@ async fn run() -> Result<ExitCode> {
     };
     let preview_slot: Arc<Mutex<Option<preview::Live>>> = Arc::new(Mutex::new(None));
     let (autostop_tx, mut autostop_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let toggle_mode = cfg.voice_input.hotkey_mode.eq_ignore_ascii_case("toggle");
+
     let toggle_max_secs = cfg.voice_input.toggle_max_secs;
-    // 兩種模式各自有合理的預設,沒明寫就跟著 hotkey_mode 走:
-    //   hold   —— 按住期間 XGrabKey 會攔掉注入的 Ctrl+V,不可能邊講邊貼,
-    //             所以用懸浮視窗給回饋,長句再跳多行編輯。
-    //   toggle —— 沒有按鍵被按住,每段直接貼到游標處,懸浮視窗就多餘了。
-    let live_paste = cfg.voice_input.live_paste.unwrap_or(toggle_mode)
-        && toggle_mode
-        && cfg.voice_input.stream_chunks_enabled;
+    // 沒明寫的話:邊講邊貼開著、懸浮視窗關著(字已經出現在游標處,不必再顯示一次)。
+    let live_paste =
+        cfg.voice_input.live_paste.unwrap_or(true) && cfg.voice_input.stream_chunks_enabled;
     if cfg.voice_input.live_paste == Some(true) && !live_paste {
-        warn!(
-            hotkey_mode = %cfg.voice_input.hotkey_mode,
-            stream_chunks_enabled = cfg.voice_input.stream_chunks_enabled,
-            "live_paste 需要 hotkey_mode=toggle 且 stream_chunks_enabled=true,這次不生效"
-        );
+        warn!("live_paste 需要 stream_chunks_enabled=true,這次不生效");
     }
     if live_paste {
         info!("邊講邊貼:每段轉完就直接貼到游標位(懸浮視窗與確認視窗因此不需要)");
@@ -958,12 +910,10 @@ async fn run() -> Result<ExitCode> {
     if want_preview && !preview_on {
         warn!("要開預覽視窗但找不到 yad,先關掉(`sudo apt install yad`)");
     }
-    if toggle_mode {
-        info!(
-            toggle_max_secs,
-            "熱鍵是 toggle 模式:按一下開始、再按一下停止(voice_input.hotkey_mode)"
-        );
-    }
+    info!(
+        toggle_max_secs,
+        "熱鍵是 toggle:按一下開始、再按一下停止(忘了按第二下就靠 toggle_max_secs 收尾)"
+    );
     let session = Session {
         recorder: recorder.clone(),
         segments: Arc::new(Mutex::new(Vec::new())),
@@ -1014,13 +964,13 @@ async fn run() -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
             edge = edge_rx.recv() => {
-                let Some(edge) = edge else {
-                    // 所有 sender 都沒了 —— portal stream 斷線且 X11 bridge 也收工。
-                    // 沒有熱鍵來源就沒有存在意義,退出讓 autostart / supervisor 重拉。
+                if edge.is_none() {
+                    // 所有 sender 都沒了。沒有熱鍵來源就沒有存在意義,退出讓
+                    // autostart / supervisor 重拉。
                     error!("熱鍵來源全部中斷,退出");
                     return Ok(ExitCode::FAILURE);
-                };
-                handle_event(edge, session.clone(), toggle_mode, toggle_max_secs).await;
+                }
+                handle_event(session.clone(), toggle_max_secs).await;
             }
             _ = autostop_rx.recv() => {
                 // toggle 逾時看門狗:錄太久了,替使用者收尾
@@ -1046,7 +996,7 @@ fn paste_back(text: &str) -> anyhow::Result<()> {
         // Wayland 下 xclip/xdotool 只對 XWayland 視窗有效,得換 wl-copy + ydotool。
         // 兩條都失敗才回錯 —— XWayland fallback 對「GUI 是 X11、compositor 是
         // Wayland」的混合環境仍然有用(mori-desktop 就是那種:強制 GDK_BACKEND=x11)。
-        if wayland_hotkey::is_wayland() {
+        if is_wayland() {
             match paste_back_wayland(text, paste_key()) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
@@ -1889,22 +1839,13 @@ impl Session {
     }
 }
 
-/// 熱鍵事件 → 開始 / 停止。兩種模式的差別只在這裡。
-async fn handle_event(edge: KeyEdge, session: Session, toggle: bool, toggle_max_secs: u64) {
-    match (toggle, edge) {
-        // hold:按下開始、放開停止
-        (false, KeyEdge::Pressed) => session.start(),
-        (false, KeyEdge::Released) => session.stop(),
-        // toggle:只認按下,一次開一次停;放開不做事
-        (true, KeyEdge::Pressed) => {
-            if session.is_recording() {
-                session.stop();
-            } else {
-                session.start();
-                session.arm_autostop(toggle_max_secs);
-            }
-        }
-        (true, KeyEdge::Released) => {}
+/// 熱鍵按一下 → 沒在錄就開始、正在錄就停止(toggle,唯一的模式)。
+async fn handle_event(session: Session, toggle_max_secs: u64) {
+    if session.is_recording() {
+        session.stop();
+    } else {
+        session.start();
+        session.arm_autostop(toggle_max_secs);
     }
 }
 

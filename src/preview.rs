@@ -107,7 +107,7 @@ fn verdict_from(code: Option<i32>, stdout: String) -> Verdict {
     }
 }
 
-/// 長句的多行編輯視窗,擋住直到使用者決定。只有 hold 模式會用到
+/// 長句的多行編輯視窗,擋住直到使用者決定。只有關掉 live_paste 時會用到
 /// (toggle 是邊講邊貼,要改直接在游標處改)。
 ///
 /// **送出要用滑鼠點按鈕,Enter 是換行** —— 這是刻意的:進到這裡就是因為

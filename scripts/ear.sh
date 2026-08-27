@@ -26,8 +26,7 @@
 # paste-back 依賴依 session 分兩組,`install` / `status` / `deps` 會自動判斷:
 #   X11     — xclip + xdotool
 #   Wayland — wl-clipboard + ydotool,且 ydotoold 要在跑、使用者要在 input 群組
-# 熱鍵來源也跟著 session 走:X11 是 XGrabKey,Wayland 是 GlobalShortcuts portal
-# (首次啟動要按同意授權)。
+# 熱鍵來源不分 session:X11 / Wayland 都靠 GNOME 快捷鍵送 SIGUSR1 給跑著的 daemon。
 
 set -u
 
@@ -73,11 +72,10 @@ LOG_OUT="/tmp/mori-ear.out"
 LOG_ERR="/tmp/mori-ear.err"
 AUTOSTART_DESKTOP="$HOME/.config/autostart/mori-ear.desktop"
 
-# Wayland portal 產物。mori-ear 走 GlobalShortcuts portal 時會自己寫這個 desktop
-# entry(GNOME 要有它才肯放行 app id 註冊),移除時要跟著清 —— 留著會變成選單裡
-# 指向已刪 binary 的孤兒。APP_ID 必須跟 src/wayland_hotkey.rs 的常數一致。
-PORTAL_APP_ID="ai.yazelin.mori-ear"
-PORTAL_DESKTOP="$HOME/.local/share/applications/$PORTAL_APP_ID.desktop"
+# 舊版(走 GlobalShortcuts portal 那版)會自己寫這個 desktop entry。portal 路徑
+# 2026-08-27 拿掉了,程式不再產生它,但既有安裝可能還留著一份孤兒 —— uninstall
+# 順手清掉。
+LEGACY_PORTAL_DESKTOP="$HOME/.local/share/applications/ai.yazelin.mori-ear.desktop"
 
 GS_SCHEMA="org.gnome.settings-daemon.plugins.media-keys"
 GS_KEY_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/mori-ear-toggle/"
@@ -171,7 +169,7 @@ is_wayland() {
 check_deps() {
     local missing=() hints=() ok=1
     if is_wayland; then
-        echo "  session:   Wayland(熱鍵走 GlobalShortcuts portal)"
+        echo "  session:   Wayland(熱鍵走 GNOME 快捷鍵 → ear talk)"
         command -v wl-copy  >/dev/null 2>&1 || { missing+=("wl-clipboard"); ok=0; }
         command -v ydotool  >/dev/null 2>&1 || { missing+=("ydotool");      ok=0; }
         if command -v ydotool >/dev/null 2>&1; then
@@ -188,7 +186,7 @@ check_deps() {
         command -v xdotool >/dev/null 2>&1 || \
             hints+=("(選用)xdotool 缺 — Wayland paste-back 失敗時的 XWayland 退路會一起沒有")
     else
-        echo "  session:   X11(熱鍵走 XGrabKey)"
+        echo "  session:   X11(熱鍵走 GNOME 快捷鍵 → ear talk)"
         command -v xclip   >/dev/null 2>&1 || { missing+=("xclip");   ok=0; }
         command -v xdotool >/dev/null 2>&1 || { missing+=("xdotool"); ok=0; }
     fi
@@ -399,7 +397,7 @@ cmd_uninstall() {
     keybind_installed     && echo "  • GNOME 快捷鍵 $GS_BINDING"
     autostart_installed   && echo "  • 開機自動啟動 $AUTOSTART_DESKTOP"
     binary_installed      && echo "  • binary $BIN"
-    [[ -f "$PORTAL_DESKTOP" ]] && echo "  • Wayland portal desktop entry $PORTAL_DESKTOP"
+    [[ -f "$LEGACY_PORTAL_DESKTOP" ]] && echo "  • 舊版 portal desktop entry $LEGACY_PORTAL_DESKTOP"
     echo "  • ear wrapper symlink / copy:$(readlink -f "$0")"
     echo
     echo "不會動(共用 / 你的資料):"
@@ -438,11 +436,11 @@ cmd_uninstall() {
         fi
     fi
 
-    if [[ -f "$PORTAL_DESKTOP" ]]; then
-        rm -f "$PORTAL_DESKTOP"
+    if [[ -f "$LEGACY_PORTAL_DESKTOP" ]]; then
+        rm -f "$LEGACY_PORTAL_DESKTOP"
         command -v update-desktop-database >/dev/null 2>&1 && \
-            update-desktop-database "$(dirname "$PORTAL_DESKTOP")" 2>/dev/null || true
-        echo "✓ Wayland portal desktop entry 移除"
+            update-desktop-database "$(dirname "$LEGACY_PORTAL_DESKTOP")" 2>/dev/null || true
+        echo "✓ 舊版 portal desktop entry 移除"
     fi
 
     # 自我刪除:Linux unlink 不影響跑中的 process,kernel 開著 fd 跑完 script 沒問題。

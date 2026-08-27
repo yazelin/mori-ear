@@ -14,8 +14,7 @@ hound = "3.5"
 reqwest = { version = "0.12", features = ["multipart", "rustls-tls", "json"], default-features = false }
 # async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
-# global hotkey(X11 / Windows;Linux Wayland 另走 ashpd GlobalShortcuts portal)
-global-hotkey = "0.6"
+
 # 對外轉譯服務的 HTTP server(GET / 驗活、POST /inference)。blocking、極小依賴,
 # 符合 ear 的極簡調性(不引 axum/hyper)。每 request 在 service thread 用 tokio Handle
 # block_on 跑 async 轉譯。
@@ -41,9 +40,12 @@ parking_lot = "0.12"
 # 即使 mori-ear 被 kill,xclip 還在持 socket → 新 instance 啟動 SingleInstance::is_single()
 # 永遠 false。修法:spawn xclip/xdotool 前 close fd >= 3,擋掉 FD 洩漏。
 [target.'cfg(target_os = "linux")'.dependencies]
-ashpd = { version = "0.13.13", default-features = false, features = ["global_shortcuts", "tokio"] }
-futures-util = { version = "0.3.33", default-features = false }
 libc = "0.2"
+
+# Windows / macOS 的全域熱鍵。Linux 不用 —— 桌面環境快捷鍵綁 `ear talk` 送 SIGUSR1,
+# 見 src/main.rs 的 run()。
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+global-hotkey = "0.6"
 
 # Windows-only:跟 mori-desktop 同一套,paste-back 改走 Win32 clipboard + SendInput Ctrl+V
 # (比 enigo text() 逐字 SCANCODE_UNICODE 快很多,長段落瞬間貼上)。

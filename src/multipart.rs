@@ -174,7 +174,11 @@ mod tests {
         let file = b"RIFF\x00\x01WAVEdata\r\nmid-crlf\x00\xff";
         let body = build("----BoundaryXYZ", file, "zh");
         let form = parse("----BoundaryXYZ", &body);
-        assert_eq!(form.file().unwrap(), file, "file bytes（含內嵌 CRLF/binary）須原封保留");
+        assert_eq!(
+            form.file().unwrap(),
+            file,
+            "file bytes（含內嵌 CRLF/binary）須原封保留"
+        );
         assert_eq!(form.text("language").as_deref(), Some("zh"));
         let file_field = form.fields.iter().find(|f| f.name == "file").unwrap();
         assert_eq!(file_field.filename.as_deref(), Some("audio.wav"));
@@ -193,6 +197,10 @@ mod tests {
     fn empty_file_part_round_trips() {
         let body = build("z", b"", "auto");
         let form = parse("z", &body);
-        assert_eq!(form.file(), Some(&b""[..]), "空 file part 應為空 slice 而非缺欄");
+        assert_eq!(
+            form.file(),
+            Some(&b""[..]),
+            "空 file part 應為空 slice 而非缺欄"
+        );
     }
 }

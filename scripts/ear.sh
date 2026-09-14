@@ -11,6 +11,7 @@
 #   ear off          # 停掉
 #   ear toggle       # 同上
 #   ear talk         # 送一次「熱鍵按下」給 daemon(GNOME 快捷鍵綁的就是這個)
+#   ear settings     # 開啟辨識模式選擇視窗（線上／本機／自動）
 #   ear status       # 看在不在跑、binary 時間、各層安裝狀態、paste-back 依賴
 #   ear deps         # 只檢查 paste-back 外部依賴(依 X11 / Wayland 分別檢查)
 #   ear log          # tail 最近 log
@@ -71,6 +72,7 @@ fi
 LOG_OUT="/tmp/mori-ear.out"
 LOG_ERR="/tmp/mori-ear.err"
 AUTOSTART_DESKTOP="$HOME/.config/autostart/mori-ear.desktop"
+SETTINGS_DESKTOP="$HOME/.local/share/applications/mori-ear-settings.desktop"
 
 # 舊版(走 GlobalShortcuts portal 那版)會自己寫這個 desktop entry。portal 路徑
 # 2026-08-27 拿掉了,程式不再產生它,但既有安裝可能還留著一份孤兒 —— uninstall
@@ -146,6 +148,26 @@ cmd_talk() {
 
 binary_installed()    { [[ -x "$BIN" ]]; }
 autostart_installed() { [[ -f "$AUTOSTART_DESKTOP" ]]; }
+settings_launcher_installed() { [[ -f "$SETTINGS_DESKTOP" ]]; }
+
+install_settings_launcher() {
+    mkdir -p "$(dirname "$SETTINGS_DESKTOP")"
+    local tmp="${SETTINGS_DESKTOP}.tmp.$$"
+    {
+        echo '[Desktop Entry]'
+        echo 'Type=Application'
+        echo 'Name=Mori 語音辨識模式'
+        echo 'Comment=切換線上、本機與自動辨識'
+        printf 'Exec="%s" --settings\n' "$BIN"
+        echo 'Icon=audio-input-microphone'
+        echo 'Terminal=false'
+        echo 'Categories=Settings;'
+        echo 'StartupNotify=false'
+    } > "$tmp"
+    mv "$tmp" "$SETTINGS_DESKTOP"
+    command -v update-desktop-database >/dev/null 2>&1 && \
+        update-desktop-database "$(dirname "$SETTINGS_DESKTOP")" 2>/dev/null || true
+}
 keybind_installed() {
     command -v gsettings >/dev/null 2>&1 || return 1
     [[ "$(gsettings get $GS_SCHEMA custom-keybindings 2>/dev/null)" == *"mori-ear-toggle"* ]]
@@ -191,11 +213,14 @@ check_deps() {
         command -v xdotool >/dev/null 2>&1 || { missing+=("xdotool"); ok=0; }
     fi
 
-    # yad = 按住熱鍵時的即時預覽視窗。缺了只是沒有預覽,轉錄與貼回照常,所以不算 missing。
+    command -v notify-send >/dev/null 2>&1 || \
+        hints+=("(選用)notify-send 缺 — 無法顯示模式切換通知:sudo apt install libnotify-bin")
+
+    # yad = 即時預覽與模式選擇視窗。缺了不影響轉錄與貼回,所以不算 missing。
     if command -v yad >/dev/null 2>&1; then
-        echo "  預覽視窗:  ✓ yad 已裝(按住熱鍵會顯示即時文字)"
+        echo "  視窗功能:  ✓ yad 已裝(即時預覽與模式選擇可用)"
     else
-        hints+=("(選用)yad 缺 — 按住熱鍵時不會有即時預覽視窗,長句也不會先給你確認:sudo apt install yad")
+        hints+=("(選用)yad 缺 — 無法使用即時預覽與模式選擇視窗:sudo apt install yad")
     fi
 
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -243,6 +268,11 @@ cmd_status() {
         echo "  keybind:   ✓ $GS_BINDING → ear talk"
     else
         echo "  keybind:   ✗ not bound"
+    fi
+    if settings_launcher_installed; then
+        echo "  mode UI:   ✓ $SETTINGS_DESKTOP"
+    else
+        echo "  mode UI:   ✗ 尚未安裝應用程式選單入口(修:ear install)"
     fi
     check_deps || true
 }
@@ -325,49 +355,53 @@ cmd_keybind() {
 }
 
 cmd_install() {
-    echo "→ 安裝 mori-ear(5 層,已裝的會跳過)"
+    echo "→ 安裝 mori-ear(6 層,已裝的會跳過)"
     echo
 
     # 先檢查再裝:缺依賴不擋安裝(binary / 熱鍵 / stdout 都還是能用),
     # 但要在使用者還盯著畫面時就說清楚,而不是等第一次講完話發現字沒貼進去。
-    echo "  [1/5] → 檢查 paste-back 依賴"
+    echo "  [1/6] → 檢查 paste-back 依賴"
     local deps_ok=1
     check_deps || deps_ok=0
 
     if binary_installed; then
-        echo "  [2/5] ✓ binary 已在 $BIN(跳過 cargo install)"
+        echo "  [2/6] ✓ binary 已在 $BIN(跳過 cargo install)"
     else
         if [[ ! -d "$REPO" ]]; then
-            echo "  [2/5] ❌ 找不到 binary,也沒有 source repo($REPO)"
+            echo "  [2/6] ❌ 找不到 binary,也沒有 source repo($REPO)"
             echo "        從原始碼裝:git clone https://github.com/yazelin/mori-ear $REPO && ear install"
             echo "        用 prebuilt: 從 https://github.com/yazelin/mori-ear/releases 下載 tar.gz,"
             echo "                     解壓後 install -m 755 mori-ear ~/.local/bin/ 再跑 ./ear.sh install"
             return 1
         fi
-        echo "  [2/5] → cargo install --path $REPO (1-2 分鐘)"
+        echo "  [2/6] → cargo install --path $REPO (1-2 分鐘)"
         (cd "$REPO" && cargo install --path . --force) || { echo "❌ cargo install 失敗"; return 1; }
     fi
 
     if autostart_installed; then
-        echo "  [3/5] ✓ autostart 已裝(跳過)"
+        echo "  [3/6] ✓ autostart 已裝(跳過)"
     else
-        echo "  [3/5] → 裝開機自動啟動"
+        echo "  [3/6] → 裝開機自動啟動"
         bash "$AUTOSTART_SCRIPT" >/dev/null
         echo "        ✓ $AUTOSTART_DESKTOP"
     fi
 
     if keybind_installed; then
-        echo "  [4/5] ✓ GNOME 快捷鍵已綁(跳過)"
+        echo "  [4/6] ✓ GNOME 快捷鍵已綁(跳過)"
     else
-        echo "  [4/5] → 綁 Ctrl+Shift+Alt+E"
+        echo "  [4/6] → 綁 Ctrl+Shift+Alt+E"
         cmd_keybind on >/dev/null
         echo "        ✓ 按 Ctrl+Shift+Alt+E 開/關"
     fi
 
+    echo "  [5/6] → 安裝模式選擇視窗入口"
+    install_settings_launcher
+    echo "        ✓ $SETTINGS_DESKTOP"
+
     if is_running; then
-        echo "  [5/5] ✓ process 已在跑(PID $(pgrep -x mori-ear | head -1))"
+        echo "  [6/6] ✓ process 已在跑(PID $(pgrep -x mori-ear | head -1))"
     else
-        echo "  [5/5] → 啟動 mori-ear"
+        echo "  [6/6] → 啟動 mori-ear"
         cmd_on >/dev/null
     fi
 
@@ -396,6 +430,7 @@ cmd_uninstall() {
     [[ -n "$(pgrep -x mori-ear)" ]] && echo "  • 跑中的 mori-ear process"
     keybind_installed     && echo "  • GNOME 快捷鍵 $GS_BINDING"
     autostart_installed   && echo "  • 開機自動啟動 $AUTOSTART_DESKTOP"
+    settings_launcher_installed && echo "  • 模式選擇入口 $SETTINGS_DESKTOP"
     binary_installed      && echo "  • binary $BIN"
     [[ -f "$LEGACY_PORTAL_DESKTOP" ]] && echo "  • 舊版 portal desktop entry $LEGACY_PORTAL_DESKTOP"
     echo "  • ear wrapper symlink / copy:$(readlink -f "$0")"
@@ -425,6 +460,13 @@ cmd_uninstall() {
     if autostart_installed; then
         rm -f "$AUTOSTART_DESKTOP"
         echo "✓ autostart entry 移除"
+    fi
+
+    if settings_launcher_installed; then
+        rm -f "$SETTINGS_DESKTOP"
+        command -v update-desktop-database >/dev/null 2>&1 && \
+            update-desktop-database "$(dirname "$SETTINGS_DESKTOP")" 2>/dev/null || true
+        echo "✓ 模式選擇入口移除"
     fi
 
     if binary_installed; then
@@ -483,6 +525,7 @@ case "${1:-toggle}" in
     off|stop)         cmd_off ;;
     toggle|"")        cmd_toggle ;;
     talk)             cmd_talk ;;
+    settings|mode)    exec "$BIN" --settings ;;
     status|st)        cmd_status ;;
     deps|dep)         check_deps ;;
     log|logs)         cmd_log ;;

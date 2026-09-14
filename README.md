@@ -97,8 +97,8 @@ tarball 內含 `mori-ear` binary + `ear.sh` + `install-autostart.sh`，不需要
 # 0. (選用) 設 Groq key(或寫進 ~/.mori/config.json 跟 mori-desktop 共用)
 export GROQ_API_KEY=gsk_xxxxx
 
-#    paste-back 依賴 —— 依你的 session 裝其中一組(不確定就跑 ./ear.sh deps 問它)
-#    另外選用:sudo apt install yad —— 關掉 live_paste 時的懸浮預覽 / 長句編輯視窗
+#    paste-back 依賴，依你的 session 裝其中一組(不確定就跑 ./ear.sh deps 問它)
+#    另外選用:sudo apt install yad，關掉 live_paste 時的懸浮預覽 / 長句編輯視窗
 #    (缺了只是沒有那個視窗,轉錄與貼回照常)
 sudo apt install xclip xdotool                 # X11
 sudo apt install wl-clipboard ydotool          # Wayland
@@ -114,7 +114,7 @@ mkdir -p ~/.local/bin && install -m 755 mori-ear ~/.local/bin/    # 免 sudo
 ./ear.sh install
 
 # 3. (選)放進 PATH,之後就能直接打 `ear status` / `ear log`
-#    兩支都放 —— ear.sh 會去同目錄找 install-autostart.sh,只放前者的話
+#    兩支都放，ear.sh 會去同目錄找 install-autostart.sh,只放前者的話
 #    日後 `ear autostart on/off` 會找不到腳本
 install -m 755 ear.sh ~/.local/bin/ear
 install -m 755 install-autostart.sh ~/.local/bin/
@@ -160,9 +160,9 @@ mori-ear &
 
 ---
 
-## Linux 便利:`ear` 一鍵 wrapper(選用)
+## Linux 便利:`ear` 便利 wrapper(選用)
 
-`scripts/ear.sh` 把「開/關/狀態/一鍵裝/一鍵拆/綁 GNOME 快捷鍵」全包成單一 `ear` 指令。clone 完 repo 後：
+`scripts/ear.sh` 把「開/關/狀態/安裝/移除/綁 GNOME 快捷鍵」全包成單一 `ear` 指令。clone 完 repo 後：
 
 ```sh
 # 1. symlink 進 PATH(repo 根目錄)
@@ -207,7 +207,7 @@ paste-back 的外部依賴依 session 分兩組，`ear deps` 會自己判斷該�
 
 預設快捷鍵 `<Ctrl><Alt>e` → `ear talk`(送 SIGUSR1 給 daemon = 一次「按下」)，要換改 `scripts/ear.sh` 頂端 `GS_BINDING` 後重跑 `ear keybind off && ear keybind on`。
 
-**Linux 的熱鍵就只有這條**:程式自己註冊全域熱鍵的兩條路(Wayland 的 GlobalShortcuts portal、X11 的 XGrabKey)在 2026-08-27 都拿掉了 —— 前者要 `xdg-desktop-portal` 1.19+(Ubuntu 24.04 是 1.18，介面不存在)，後者在 Wayland 下只有焦點停在 XWayland 視窗時才收得到、回 X11 又會跟桌面快捷鍵搶同一組鍵。桌面環境的自訂快捷鍵在 compositor 層，X11 / Wayland 都會響，一條就夠。程式收到 `SIGUSR1` 就當成一次「按下」。手動觸發:`pkill -USR1 -x mori-ear`。
+**Linux 的熱鍵就只有這條**:程式自己註冊全域熱鍵的兩條路(Wayland 的 GlobalShortcuts portal、X11 的 XGrabKey)在 2026-08-27 都拿掉了，前者要 `xdg-desktop-portal` 1.19+(Ubuntu 24.04 是 1.18，介面不存在)，後者在 Wayland 下只有焦點停在 XWayland 視窗時才收得到、回 X11 又會跟桌面快捷鍵搶同一組鍵。桌面環境的自訂快捷鍵在 compositor 層，X11 / Wayland 都會響，一條就夠。程式收到 `SIGUSR1` 就當成一次「按下」。手動觸發:`pkill -USR1 -x mori-ear`。
 
 ---
 
@@ -278,7 +278,7 @@ gsettings reset org.gnome.settings-daemon.plugins.media-keys custom-keybindings 
 那個介面只給得起「按下」，給不了「放開」，所以 hold 在 Linux 根本做不出來。與其留一個
 在主力平台上不能用的模式，不如定死成 toggle。舊 config 裡的 `hotkey_mode` 會被忽略。
 
-`live_paste` 與 `preview_enabled` 不設的話:邊講邊貼開著、懸浮視窗關著(字已經出現在
+`live_paste` 與 `preview_enabled` 不設的話：邊講邊貼開著、懸浮視窗關著(字已經出現在
 游標處，再開一個視窗只是重複顯示)。把 `live_paste` 設成 `false` 就回到「停止後整段送出」，
 懸浮視窗與長句編輯視窗這時才有意義。
 
@@ -300,6 +300,41 @@ Whisper 對安靜的音訊會幻覺出「謝謝」「請訂閱」「祝你生日
 
 ---
 
+## 用語音查詢與切換模式
+
+若平常口述容易被切成碎句，可在 `voice_input` 設定 `stream_pause_ms: 1200`、`stream_min_segment_ms: 2500`，讓程式等較長的停頓再送出。輕聲字音容易被剪掉時，可把 `trim_silence_threshold` 降到 `0.008`，並把 `trim_silence_min_ms` 調到 `600`。代價是文字較晚出現，也可能保留較多背景聲音；請依麥克風環境調整。
+
+分段會逐個 20 毫秒音訊片段檢查，整個等待區間都低於門檻才算停頓。檢查與取出音訊在同一次鎖定內完成，避免重新開口的聲音被取進前一段。
+
+按平常的語音輸入熱鍵，即可說出下列指令。開啟分段辨識時，指令會在錄音期間處理；查詢、切換和播放回覆都不會停止麥克風。關閉分段辨識時，需再按一次停止錄音才會辨識：
+
+- 「現在是什麼模式？」、「什麼模式？」或「Mori，現在用哪個模式？」
+- 「Mori，切換到 auto 模式」或「Mori，切換到自動模式」
+- 「Mori，切換到 Groq 模式」、「Mori，幫我換成雲端模式」或「Mori，切換成線上模式」
+- 「Mori，切換到 local 模式」、「Mori，幫我換成本機模式」或「Mori，切換成離線模式」
+
+查詢模式不必先叫名字；切換模式仍需先叫 Mori。容許大小寫、空白、常見標點、簡體字，以及 Mori 被辨識成「Morris／Moris／Maurice／莫里斯／莫莉／茉莉／摩利／毛利」等音近字。也接受「Maurice 現在在做什麼模式？」這類句型。仍需是簡短、完整的指令；否定句、引述或後面接其他內容的句子不會執行。說英文容易辨識錯時，可以用「自動／雲端／本機」。請把指令一次說完，避免中途停頓被切成兩段。
+
+辨識出的指令不會貼到游標處。Mori 會執行指令，再透過獨立播放佇列播出 Larch「輕柔女孩」的簡短提示：「目前是自動模式／雲端模式／本機模式」。錄音、辨識與一般文字輸出可以繼續，不必等語音播完。Linux 也會顯示桌面通知，需要 `notify-send` 和桌面通知服務；其他平台目前僅有語音與紀錄。
+
+`voice_input.toggle_max_secs` 是整輪錄音的總時長上限，設為 `0` 可關閉。`voice_input.idle_silence_secs` 是未偵測到人聲的停止期限（預設 `0`，不啟用）；例如設定 `60`，會在 60 秒沒有確認人聲後停止。WebRTC VAD 搭配音量門檻，在最近 500 毫秒內至少偵測到 200 毫秒人聲才重設計時；短促雜音和分段送出不會重設計時。語音輸入送辨識前也會檢查人聲，減少背景聲產生的錯誤字幕。VAD 不負責裁切字詞，既有停頓切段與靜音剪裁設定不變。背景談話、喇叭播放的人聲仍可能被算進去；目前沒有回音消除。
+
+### 用視窗切換模式（Linux）
+
+執行 `ear settings` 或 `mori-ear --settings`，按「線上 Groq」、「本機」或「自動」即可儲存設定；視窗顯示目前模式與切換結果，不必使用語音指令。需要安裝 `yad`。視窗獨立於錄音程序，關閉視窗不會停止錄音，切換也不需重新啟動。新送出的片段使用新模式，已送出的片段維持原模式。自動模式先用本機，本機失敗才改用 Groq。停用語音指令不影響視窗切換。
+
+手動停止後，上一輪尚未完成辨識時，暫時不能開始新一輪錄音。目前沒有回音消除；使用喇叭時，麥克風可能錄到提示聲音，使用耳機可減少這種情況。
+
+切換會保留 `~/.mori/ear.json` 的其他欄位，只更新 `backend`。寫入成功才回報新模式；缺少 Groq key 或設定無法寫入時，維持原設定並提示「切換失敗」。下一段錄音及未指定 `backend` 的 HTTP 請求會使用新設定，不必重啟。批次與 HTTP 轉錄只產生文字，不會執行語音指令。
+
+`mode_commands` 的三個開關預設都為 `true`，修改後不必重啟：`enabled` 關掉後，所有句子都當一般語音輸入；`sound` 控制語音回覆；`notification` 控制桌面通知。下方設定範例可直接參考。
+
+切換指令只接受原始辨識文字；模式查詢則允許用潤飾後的簡短問句再判斷一次。「現場模式」沒有明確對應，不會自動猜成線上或離線。
+
+提示音已內建，也可放入自己的 16-bit PCM WAV 檔覆蓋：`~/.mori/mori-ear/voices/auto.wav`、`groq.wav`、`local.wav`、`error.wav`。音檔須少於 30 秒，替換後下一次播放就會生效。台詞在 [assets/voices/lines.json](assets/voices/lines.json)。
+
+`auto` 是本機優先，本機失敗才使用 Groq，並不會判斷辨識品質再重試。若想比較本機與 Groq 的精準度，直接切換 `local` 和 `groq` 即可。`backend` 只控制語音辨識；文字潤飾仍受 `raw` 設定控制。
+
 ## 設定
 
 `~/.mori/ear.json`(可選，完整範例)：
@@ -309,6 +344,11 @@ Whisper 對安靜的音訊會幻覺出「謝謝」「請訂閱」「祝你生日
   "hotkey": "Ctrl+Alt+E",
   "groq_api_key": "gsk_...",
   "backend": "auto",
+  "mode_commands": {
+    "enabled": true,
+    "sound": true,
+    "notification": true
+  },
   "language": "zh",
   "raw": false,
   "cleanup_prompt_file": "~/.mori/voice_input/USER-00.純文字輸入.md",
@@ -446,22 +486,22 @@ mori-ear --serve
 | 環境 | hotkey | paste-back | 備註 |
 |---|---|---|---|
 | **Windows** | 尚未實測 | 尚未實測 | 已有 Win32 `SetClipboardData` + `SendInput Ctrl+V` 路徑，但新的 toggle、分段轉譯與邊講邊貼流程尚未驗證，可能正常，也可能遇到問題；config 路徑 `%USERPROFILE%\.mori\` |
-| Linux **X11** | 未實測(砍掉 XGrabKey 之後沒在真 X11 session 跑過;走的是跟 Wayland 同一條 GNOME 快捷鍵) | 已實測 | 走 `xclip` + `xdotool`，用 `xdotool getactivewindow` 偵測 terminal 自動切 `ctrl+shift+v`(X11 不讀 `paste_key`) |
-| Linux **Wayland** | 已實測(GNOME 快捷鍵 → `ear talk` → SIGUSR1) | 已實測(2026-08-27,GNOME 46 / Ubuntu 24.04) | 24.04 要先開 `/dev/uinput` 權限、且 `ydotool` 0.1.x 只吃名字語法(兩個坑見下);Wayland 查不到焦點視窗,終端機要自己設 `"paste_key": "ctrl+shift+v"` |
+| Linux **X11** | 未實測(砍掉 XGrabKey 之後沒在真 X11 session 跑過；走的是跟 Wayland 同一條 GNOME 快捷鍵) | 已實測 | 走 `xclip` + `xdotool`，用 `xdotool getactivewindow` 偵測 terminal 自動切 `ctrl+shift+v`(X11 不讀 `paste_key`) |
+| Linux **Wayland** | 已實測(GNOME 快捷鍵 → `ear talk` → SIGUSR1) | 已實測(2026-08-27,GNOME 46 / Ubuntu 24.04) | 24.04 要先開 `/dev/uinput` 權限、且 `ydotool` 0.1.x 只吃名字語法(兩個坑見下);Wayland 查不到焦點視窗，終端機要自己設 `"paste_key": "ctrl+shift+v"` |
 | macOS | 理論支援 | 理論支援 | 第一次跑要授權 Accessibility；paste-back 走 enigo `text()` 逐字 fallback |
 
 ### Linux Wayland 細節
 
 Linux 的熱鍵**只有一條路**:桌面環境的自訂快捷鍵綁 `ear talk` → `SIGUSR1`(`ear install` / `ear keybind on` 會自動綁 GNOME 那顆)。X11 / Wayland 都走這條，因為快捷鍵是 compositor 層處理的。
 
-原本另外兩條在 2026-08-27 砍掉了:
+原本另外兩條在 2026-08-27 砍掉了：
 
-- `org.freedesktop.portal.GlobalShortcuts` —— 要 `xdg-desktop-portal` 1.19+，Ubuntu 24.04 是 1.18，那顆介面在上面根本不存在;而在有它的系統上，桌面快捷鍵這條一樣會動，重複。連帶把 `ashpd` 依賴一起拿掉。
-- X11 `XGrabKey`(`global-hotkey` crate)—— Wayland 下只有焦點停在 XWayland 視窗時才收得到按鍵;回 X11 又會跟桌面環境已綁的同一組鍵互搶。`global-hotkey` 現在只編進 Windows / macOS。
+- `org.freedesktop.portal.GlobalShortcuts`，要 `xdg-desktop-portal` 1.19+，Ubuntu 24.04 是 1.18，那顆介面在上面根本不存在；而在有它的系統上，桌面快捷鍵這條一樣會動，重複。連帶把 `ashpd` 依賴一起拿掉。
+- X11 `XGrabKey`(`global-hotkey` crate)，Wayland 下只有焦點停在 XWayland 視窗時才收得到按鍵；回 X11 又會跟桌面環境已綁的同一組鍵互搶。`global-hotkey` 現在只編進 Windows / macOS。
 
 paste-back 在 Ubuntu 24.04 上有兩個坑。
 
-**(1) `/dev/uinput` 權限**:`ydotool` 0.1.8 沒有 `ydotoold`，自己開 `/dev/uinput`，但那顆節點預設是 `root:root 0600`，人在 `input` 群組也開不了(訊息是 `failed to open uinput device` 加 core dump)。要放行:
+**(1) `/dev/uinput` 權限**:`ydotool` 0.1.8 沒有 `ydotoold`，自己開 `/dev/uinput`，但那顆節點預設是 `root:root 0600`，人在 `input` 群組也開不了(訊息是 `failed to open uinput device` 加 core dump)。要放行：
 
 ```sh
 echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' \
@@ -469,11 +509,11 @@ echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput
 sudo modprobe uinput && sudo udevadm control --reload && sudo udevadm trigger
 ```
 
-**(2) 兩版 ydotool 語法不同，餵錯不會報錯**:0.1.x 吃 `ydotool key ctrl+v`(名字)，1.x 吃 `ydotool key 29:1 47:1 47:0 29:0`(keycode)。實測 0.1.8 收到 keycode 語法會 **exit 0** 並送出 keycode 5(數字鍵 `4`)—— 焦點視窗被打進垃圾字元，log 卻回報「貼回完成」。所以程式會先跑一次 `ydotool key --help` 認版本(見 `ydotool_wants_named_keys`)，再挑對的語法送。
+**(2) 兩版 ydotool 語法不同，餵錯不會報錯**:0.1.x 吃 `ydotool key ctrl+v`(名字)，1.x 吃 `ydotool key 29:1 47:1 47:0 29:0`(keycode)。實測 0.1.8 收到 keycode 語法會 **exit 0** 並送出 keycode 5(數字鍵 `4`)，焦點視窗被打進垃圾字元，log 卻回報「貼回完成」。所以程式會先跑一次 `ydotool key --help` 認版本(見 `ydotool_wants_named_keys`)，再挑對的語法送。
 
 幾個要知道的：
 
-- **`~/.mori/ear.json` 的 `hotkey` 欄位在 Linux 沒有作用**。實際綁哪一組鍵由桌面環境決定 —— 改 `scripts/ear.sh` 頂端的 `GS_BINDING` 再 `ear keybind off && ear keybind on`，或直接去「設定 → 鍵盤 → 檢視及自訂快捷鍵」改。
+- **`~/.mori/ear.json` 的 `hotkey` 欄位在 Linux 沒有作用**。實際綁哪一組鍵由桌面環境決定，改 `scripts/ear.sh` 頂端的 `GS_BINDING` 再 `ear keybind off && ear keybind on`，或直接去「設定 → 鍵盤 → 檢視及自訂快捷鍵」改。
 - **偵測不到 terminal**。Wayland 不讓 client 查焦點視窗，所以自動 Ctrl+V / Ctrl+Shift+V 切換在這裡失效。terminal 使用者請設 `paste_key`。
 - **paste-back 靠 `ydotool`**。`wl-copy` 寫 clipboard、`ydotool` 透過 `/dev/uinput` 造虛擬鍵盤注入按鍵(所以任何視窗都吃)。`/dev/uinput` 開不了或 `ydotoold`(1.x 才有)沒跑就會失敗，失敗時自動退回 XWayland 那條(`xclip`+`xdotool`，只對 X11 視窗有效)。
 

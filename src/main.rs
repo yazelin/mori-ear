@@ -47,11 +47,15 @@ use tracing::{error, info, warn};
 mod audio;
 mod cleanup;
 mod local_stt;
+mod mode_command;
+mod mode_ui;
+mod mode_voice;
 mod multipart;
 mod preview;
 mod service;
 mod stt;
 mod stt_prompt;
+mod voice_activity;
 mod watchdog;
 
 const DEFAULT_HOTKEY: &str = "Ctrl+Alt+E";
@@ -179,6 +183,9 @@ struct VoiceInputConfig {
     /// 錄超過這麼久就自動停(預設 120 秒),兜住「忘記按第二下」。設 0 = 不自動停。
     #[serde(default = "default_toggle_max_secs")]
     toggle_max_secs: u64,
+    /// Stop only after this many seconds below the silence threshold. 0 disables it.
+    #[serde(default)]
+    idle_silence_secs: u64,
     /// 每段轉完就直接貼到游標位。不設就是開。
     ///
     /// 跟 `preview_confirm_chars` 互斥:字都邊講邊貼出去了,就沒有「先給你確認」
@@ -231,6 +238,7 @@ impl Default for VoiceInputConfig {
             preview_enabled: None,
             preview_confirm_chars: default_preview_confirm_chars(),
             toggle_max_secs: default_toggle_max_secs(),
+            idle_silence_secs: 0,
             live_paste: None,
         }
     }
@@ -354,8 +362,8 @@ impl Config {
 /// 跨平台 home dir。
 /// - Unix:`$HOME`
 /// - Windows:`%USERPROFILE%`(沒設 `HOME` 時 fallback,跟 mori-desktop 同套)
-/// 兩個都缺 → 回空 path,下游 read_to_string 就讓它正常失敗
-/// (config 缺也能跑,只要 `GROQ_API_KEY` env 有設)
+///   兩個都缺 → 回空 path,下游 read_to_string 就讓它正常失敗
+///   (config 缺也能跑,只要 `GROQ_API_KEY` env 有設)
 pub(crate) fn home_dir() -> std::path::PathBuf {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -541,6 +549,7 @@ async fn main() -> ExitCode {
         }
         CliMode::Batch(path) => batch(&path).await,
         CliMode::Serve => serve_only().await,
+        CliMode::Settings => mode_ui::run(),
         CliMode::Daemon => run().await,
         CliMode::Error(msg) => {
             eprintln!("mori-ear: {msg}\n");
@@ -559,6 +568,7 @@ async fn main() -> ExitCode {
 }
 
 enum CliMode {
+    Settings,
     Daemon,
     Batch(String),
     /// 純轉譯服務模式(無 hotkey、無 hotkey single-instance):只開 HTTP `/inference` + 寫
@@ -576,6 +586,7 @@ fn parse_cli(args: &[String]) -> CliMode {
         match args[i].as_str() {
             "-h" | "--help" => return CliMode::Help,
             "--serve" => return CliMode::Serve,
+            "--settings" => return CliMode::Settings,
             "--input" => {
                 let Some(v) = args.get(i + 1) else {
                     return CliMode::Error("--input 需要 file path".into());
@@ -602,6 +613,7 @@ fn print_help() {
                                      無熱鍵、無 hotkey single-instance。給 mori-desktop /\n\
                                      AgentOS 在需要時自動拉起;已有在線服務時自動讓位 exit\n\
            mori-ear --input <file>   batch 模式:轉錄一個音檔 → cleanup → 印 stdout 後 exit\n\
+           mori-ear --settings       開啟辨識模式選擇視窗（Linux）\n\
                                      (跳過 single-instance lock、不裝熱鍵、不 paste-back)\n\
                                      支援 Groq Whisper 認的格式:wav/mp3/m4a/flac/webm/ogg\n\
            mori-ear --help           印這段\n\
@@ -857,6 +869,8 @@ async fn run() -> Result<ExitCode> {
     drop(edge_tx);
 
     // 共用狀態:目前是不是錄音中。audio::Recorder handle 也存這
+    // cpal Stream 由主事件迴圈持有；其他執行緒只碰獨立的 BufferHandle。
+    #[allow(clippy::arc_with_non_send_sync)]
     let recorder = Arc::new(Mutex::new(None::<audio::Recorder>));
 
     // Ctrl+C / SIGTERM graceful shutdown
@@ -891,6 +905,7 @@ async fn run() -> Result<ExitCode> {
         backend: backend_arc.clone(),
         timeout: transcribe_timeout,
         confirm_chars: cfg.voice_input.preview_confirm_chars,
+        mode_feedback: mode_voice::start_feedback_worker(),
     };
     let preview_slot: Arc<Mutex<Option<preview::Live>>> = Arc::new(Mutex::new(None));
     let (autostop_tx, mut autostop_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -912,6 +927,7 @@ async fn run() -> Result<ExitCode> {
     }
     info!(
         toggle_max_secs,
+        idle_silence_secs = cfg.voice_input.idle_silence_secs,
         "熱鍵是 toggle:按一下開始、再按一下停止(忘了按第二下就靠 toggle_max_secs 收尾)"
     );
     let session = Session {
@@ -926,7 +942,9 @@ async fn run() -> Result<ExitCode> {
         stream: stream_cfg,
         preview_on,
         live_paste,
+        idle_silence_secs: cfg.voice_input.idle_silence_secs,
         emit_turn: Arc::new(Emitter::default()),
+        finishing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     // 對外轉譯服務 —— 讓 AgentOS(http-service skill)/ mori-desktop 當 client 消費 ear 的轉錄。
@@ -973,7 +991,7 @@ async fn run() -> Result<ExitCode> {
                 handle_event(session.clone(), toggle_max_secs).await;
             }
             _ = autostop_rx.recv() => {
-                // toggle 逾時看門狗:錄太久了,替使用者收尾
+                // Optional total-duration limit or continuous-silence timeout.
                 session.stop();
             }
         }
@@ -1468,6 +1486,7 @@ const MIN_SPEECH_SECS: f32 = 0.35;
 /// 一段語音走完全程需要的東西。每段一份 clone,參數列才不會爆炸。
 #[derive(Clone)]
 struct Pipeline {
+    mode_feedback: tokio::sync::mpsc::Sender<mode_voice::Feedback>,
     api_key: Arc<Option<String>>,
     language: Arc<String>,
     skip_cleanup: Arc<bool>,
@@ -1481,12 +1500,34 @@ struct Pipeline {
 }
 
 impl Pipeline {
+    fn respond_to_command(&self, command: mode_command::Command) {
+        let settings = mode_command::settings();
+        let mode = match mode_command::execute(command, &self.backend, self.api_key.is_some()) {
+            Ok(mode) => mode,
+            Err(e) => {
+                error!(error = ?e, "模式未切換");
+                "error".to_owned()
+            }
+        };
+        if self
+            .mode_feedback
+            .try_send(mode_voice::Feedback {
+                mode,
+                switched: matches!(command, mode_command::Command::Switch(_)),
+                settings,
+            })
+            .is_err()
+        {
+            warn!("模式回覆佇列已滿或關閉，請查看設定確認模式");
+        }
+    }
+
     async fn transcribe_and_clean(
         &self,
         label: &str,
         wav: Vec<u8>,
         enc: audio::Encoded,
-    ) -> Option<String> {
+    ) -> Option<Segment> {
         let audio::Encoded {
             duration_secs,
             rms_db,
@@ -1506,9 +1547,20 @@ impl Pipeline {
             );
             return None;
         }
+        match voice_activity::wav_has_speech(&wav) {
+            Ok(true) => {}
+            Ok(false) => {
+                info!(label, "VAD 未偵測到足夠人聲，略過辨識");
+                return None;
+            }
+            Err(e) => {
+                warn!(label, error = ?e, "VAD 音訊檢查失敗，略過辨識");
+                return None;
+            }
+        }
         let t0 = std::time::Instant::now();
         let (backend, api_key, language, prompt_file) = (
-            self.backend.clone(),
+            mode_command::current(&self.backend),
             self.api_key.clone(),
             self.language.clone(),
             self.stt_initial_prompt_file.clone(),
@@ -1537,6 +1589,13 @@ impl Pipeline {
             info!(label, stt_ms, "這段沒轉出內容");
             return None;
         }
+        // Preserve commands before cleanup. Execute only after capture has stopped.
+        if mode_command::settings().enabled {
+            if let Some(command) = mode_command::parse(&raw) {
+                info!(label, ?command, "已辨識模式指令，錄音持續進行");
+                return Some(Segment::Command(command));
+            }
+        }
 
         // LLM cleanup(繁中校正 + 標點 + 簡轉繁)。需 Groq key;skip_cleanup 或無 key
         // (離線)→ 直接用 raw。cleanup 失敗也 fallback raw。
@@ -1559,6 +1618,12 @@ impl Pipeline {
             info!(label, "無 Groq key,跳過 cleanup,用 raw whisper output");
             raw
         };
+        if mode_command::settings().enabled {
+            if let Some(command) = mode_command::status_after_cleanup(&text) {
+                info!(label, "潤飾後辨識到模式查詢，錄音持續進行");
+                return Some(Segment::Command(command));
+            }
+        }
         info!(
             label,
             duration_secs,
@@ -1567,7 +1632,20 @@ impl Pipeline {
             chars = text.chars().count(),
             "✓ 這段完成"
         );
-        Some(text)
+        Some(Segment::Dictation(text))
+    }
+}
+
+enum Segment {
+    Dictation(String),
+    Command(mode_command::Command),
+}
+impl Segment {
+    fn text(&self) -> Option<&str> {
+        match self {
+            Self::Dictation(text) => Some(text),
+            Self::Command(_) => None,
+        }
     }
 }
 
@@ -1580,7 +1658,10 @@ fn emit(text: &str, paste_back_enabled: bool) {
     drop(out);
 
     if !paste_back_enabled {
-        info!(chars = text.chars().count(), "✓ 轉錄完成(paste_back=false,只印 stdout)");
+        info!(
+            chars = text.chars().count(),
+            "✓ 轉錄完成(paste_back=false,只印 stdout)"
+        );
         return;
     }
     match paste_back(text) {
@@ -1595,9 +1676,10 @@ fn emit(text: &str, paste_back_enabled: bool) {
 /// 一次錄音會用到的共享狀態。hold 與 toggle 兩種模式共用同一組開始 / 停止。
 #[derive(Clone)]
 struct Session {
+    idle_silence_secs: u64,
     recorder: Arc<Mutex<Option<audio::Recorder>>>,
     /// 停頓切出去的各段任務,按講話順序;停止時收回來接成一句
-    segments: Arc<Mutex<Vec<tokio::task::JoinHandle<Option<String>>>>>,
+    segments: Arc<Mutex<Vec<tokio::task::JoinHandle<Option<Segment>>>>>,
     chunker: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// toggle 模式的逾時看門狗 —— 忘記按第二下時通知主迴圈收尾。
     /// 只能用訊號不能直接呼叫 stop():錄音器內含 cpal Stream,不是 Send,
@@ -1613,6 +1695,14 @@ struct Session {
     live_paste: bool,
     /// live_paste 的輸出排序器:下一個該輪到誰貼
     emit_turn: Arc<Emitter>,
+    finishing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct FinishGuard(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for FinishGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// 讓併行跑完的分段照講話順序輸出。
@@ -1650,12 +1740,16 @@ impl Session {
     }
 
     fn start(&self) {
+        if self.finishing.load(std::sync::atomic::Ordering::Acquire) {
+            warn!("上一段手動停止的錄音仍在收尾，請稍後再開始錄音");
+            return;
+        }
         let mut slot = self.recorder.lock();
         if slot.is_some() {
             warn!("已在錄音中,忽略");
             return;
         }
-        let r = match audio::Recorder::start() {
+        let r = match audio::Recorder::start(self.stream.threshold) {
             Ok(r) => r,
             Err(e) => {
                 error!(error = ?e, "錄音啟動失敗");
@@ -1673,7 +1767,9 @@ impl Session {
                 Err(e) => warn!(error = ?e, "預覽視窗開不起來,照常轉錄"),
             }
         }
-        if self.stream.enabled {
+        if self.stream.enabled || self.idle_silence_secs > 0 {
+            let idle_secs = self.idle_silence_secs;
+            let idle_stop = self.autostop_tx.clone();
             let (buf, stream, trim, live) = (r.buffer(), self.stream, self.trim, self.live_paste);
             let (pipe, segs, pv, emitter) = (
                 self.pipeline.clone(),
@@ -1685,13 +1781,20 @@ impl Session {
                 let mut n = 0usize;
                 loop {
                     tokio::time::sleep(Duration::from_millis(150)).await;
-                    if buf.secs_buffered() * 1000.0 < stream.min_segment_ms as f32 {
+                    if idle_secs > 0 && buf.silence_elapsed() >= Duration::from_secs(idle_secs) {
+                        info!(idle_secs, "連續靜音達上限，自動停止錄音");
+                        let _ = idle_stop.try_send(());
+                        break;
+                    }
+                    if !stream.enabled {
                         continue;
                     }
-                    if !buf.tail_is_silent(stream.pause_ms, stream.threshold) {
-                        continue;
-                    }
-                    let Some((wav, enc)) = buf.take_wav(&trim) else {
+                    let Some((wav, enc)) = buf.take_after_pause(
+                        stream.min_segment_ms,
+                        stream.pause_ms,
+                        stream.threshold,
+                        &trim,
+                    ) else {
                         continue;
                     };
                     n += 1;
@@ -1706,27 +1809,34 @@ impl Session {
                     let idx = n - 1;
                     let task = tokio::spawn(async move {
                         let out = p.transcribe_and_clean(&label, wav, enc).await;
-                        if let Some(t) = out.as_deref() {
+                        let is_command = matches!(out, Some(Segment::Command(_)));
+                        if let Some(t) = out.as_ref().and_then(Segment::text) {
                             // 純追加,不清空(清空會閃、會殘留,見 preview.rs 註解)
                             if let Some(w) = pv.lock().as_mut() {
                                 w.append(t.trim());
                             }
                         }
-                        if !live {
-                            return out;
-                        }
                         // 邊講邊貼:排隊等前面的段落貼完,自己貼完就放行下一個。
                         // 回 None 是因為已經貼出去了,不要再併進停止時那一句。
                         let paste = *p.paste_back_enabled;
                         turn.in_order(idx, || {
-                            if let Some(t) = out.as_deref() {
-                                if !t.trim().is_empty() {
-                                    emit(t.trim(), paste);
+                            if let Some(Segment::Command(command)) = &out {
+                                p.respond_to_command(*command);
+                            } else if live {
+                                if let Some(t) = out.as_ref().and_then(Segment::text) {
+                                    if !t.trim().is_empty() {
+                                        emit(t.trim(), paste);
+                                    }
                                 }
                             }
                         })
                         .await;
-                        None
+                        // Commands are already handled. Retain only non-live dictation.
+                        if !live && !is_command {
+                            out
+                        } else {
+                            None
+                        }
                     });
                     segs.lock().push(task);
                 }
@@ -1749,6 +1859,9 @@ impl Session {
         let Some(r) = self.recorder.lock().take() else {
             return;
         };
+        self.finishing
+            .store(true, std::sync::atomic::Ordering::Release);
+        let finish_guard = FinishGuard(self.finishing.clone());
         let done: Vec<_> = std::mem::take(&mut *self.segments.lock());
         // 尾巴可能剛被切段器取走 → 0 samples,那不是錯誤,交給守門判
         let (wav, enc) = r.stop_and_encode_wav(self.trim).unwrap_or_else(|_| {
@@ -1774,22 +1887,32 @@ impl Session {
         let confirm_on = self.preview_on && !self.live_paste;
         let (pipeline, preview) = (self.pipeline.clone(), self.preview.clone());
         tokio::spawn(async move {
+            let _finish_guard = finish_guard;
             // 尾巴自己轉;先前各段多半在你講話的時候就跑完了,這裡只是收回來
             let tail = pipeline.transcribe_and_clean("tail", wav, enc).await;
-            let mut parts: Vec<String> = Vec::with_capacity(done.len() + 1);
+            let mut parts = Vec::with_capacity(done.len() + 1);
             for task in done {
                 match task.await {
-                    Ok(Some(t)) if !t.trim().is_empty() => parts.push(t.trim().to_string()),
+                    Ok(Some(segment)) => parts.push(segment),
                     Ok(_) => {}
                     Err(e) => warn!(error = ?e, "某一段的任務沒收回來,略過"),
                 }
             }
-            if let Some(t) = tail {
-                if !t.trim().is_empty() {
-                    parts.push(t.trim().to_string());
-                }
+            if let Some(segment) = tail {
+                parts.push(segment);
             }
             preview.lock().take(); // 即時預覽的任務到此為止
+            let mut dictation = Vec::new();
+            for segment in parts {
+                if let Segment::Command(command) = segment {
+                    pipeline.respond_to_command(command);
+                } else if let Segment::Dictation(text) = segment {
+                    if !text.trim().is_empty() {
+                        dictation.push(text.trim().to_owned());
+                    }
+                }
+            }
+            let parts = dictation;
             if parts.is_empty() {
                 info!("所有分段都沒轉出內容,不貼回");
                 return;
@@ -1811,7 +1934,8 @@ impl Session {
             info!(chars, threshold = pipeline.confirm_chars, "太長,先給你確認");
             let paste = *pipeline.paste_back_enabled;
             tokio::task::spawn_blocking(move || {
-                match preview::confirm("mori-ear — 可以直接改,Enter 送出 / Esc 丟棄", &text) {
+                match preview::confirm("mori-ear — 可以直接改,Enter 送出 / Esc 丟棄", &text)
+                {
                     // 送出的是視窗裡當下的文字,使用者可能改過
                     Ok(preview::Verdict::Send(final_text)) => emit(&final_text, paste),
                     Ok(preview::Verdict::Discard) => info!("你丟棄了這一段"),
@@ -1845,13 +1969,66 @@ async fn handle_event(session: Session, toggle_max_secs: u64) {
         session.stop();
     } else {
         session.start();
-        session.arm_autostop(toggle_max_secs);
+        if session.is_recording() {
+            session.arm_autostop(toggle_max_secs);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_mode_playback_does_not_block_following_dictation() {
+        let (tx, mut replies) = tokio::sync::mpsc::channel(8);
+        let pipeline = Pipeline {
+            mode_feedback: tx,
+            api_key: Arc::new(None),
+            language: Arc::new("zh".into()),
+            skip_cleanup: Arc::new(true),
+            cleanup_prompt_file: Arc::new(String::new()),
+            stt_initial_prompt_file: Arc::new(String::new()),
+            paste_back_enabled: Arc::new(false),
+            backend: Arc::new("auto".into()),
+            timeout: Duration::from_secs(1),
+            confirm_chars: 150,
+        };
+        let order = Emitter::default();
+        let mut dictated = false;
+        tokio::time::timeout(Duration::from_millis(200), async {
+            order
+                .in_order(0, || {
+                    pipeline.respond_to_command(mode_command::Command::Status)
+                })
+                .await;
+            // No playback consumer has run; the next segment must still be delivered.
+            order.in_order(1, || dictated = true).await;
+        })
+        .await
+        .unwrap();
+        assert!(dictated);
+        assert!(!replies.try_recv().unwrap().switched);
+    }
+
+    #[test]
+    fn commands_have_no_pasteable_text_and_cleanup_cannot_create_commands() {
+        assert!(Segment::Command(mode_command::Command::Status)
+            .text()
+            .is_none());
+        let cleaned = Segment::Dictation("mori切換到auto模式".into());
+        assert_eq!(cleaned.text(), Some("mori切換到auto模式"));
+        assert!(!matches!(cleaned, Segment::Command(_)));
+    }
+
+    #[test]
+    fn finishing_guard_releases_capture_even_on_early_return() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        {
+            let _guard = FinishGuard(flag.clone());
+        }
+        assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     /// 各段的轉譯是併行的,完成順序不保證 —— 但貼出去一定要照講話順序。
     /// 這裡故意讓後面的段先完成,看排序器有沒有把它擋住。

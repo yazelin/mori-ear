@@ -37,6 +37,7 @@ const FRAME_MS: u32 = 20;
 const EDGE_PAD_MS: u32 = 80;
 
 pub struct Recorder {
+    last_voice: Arc<Mutex<std::time::Instant>>,
     /// cpal Stream(Send 但內含 platform-specific 資源)。drop 時自動 stop。
     _stream: cpal::Stream,
     samples: Arc<Mutex<Vec<f32>>>,
@@ -45,7 +46,7 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub fn start() -> Result<Self> {
+    pub fn start(silence_threshold: f32) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_input_device()
@@ -62,6 +63,8 @@ impl Recorder {
             (sample_rate as usize) * (channels as usize) * 30, // 預留 30 秒
         )));
         let samples_for_cb = samples.clone();
+        let last_voice = Arc::new(Mutex::new(std::time::Instant::now()));
+        let last_voice_for_cb = last_voice.clone();
 
         let err_fn = |err| tracing::warn!(error = ?err, "audio stream error");
 
@@ -69,6 +72,13 @@ impl Recorder {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _| {
+                    observe_activity(
+                        data,
+                        sample_rate,
+                        channels,
+                        silence_threshold,
+                        &last_voice_for_cb,
+                    );
                     samples_for_cb.lock().extend_from_slice(data);
                 },
                 err_fn,
@@ -78,7 +88,15 @@ impl Recorder {
                 &stream_config,
                 move |data: &[i16], _| {
                     let mut buf = samples_for_cb.lock();
+                    let start = buf.len();
                     buf.extend(data.iter().map(|&s| s as f32 / i16::MAX as f32));
+                    observe_activity(
+                        &buf[start..],
+                        sample_rate,
+                        channels,
+                        silence_threshold,
+                        &last_voice_for_cb,
+                    );
                 },
                 err_fn,
                 None,
@@ -87,9 +105,18 @@ impl Recorder {
                 &stream_config,
                 move |data: &[u16], _| {
                     let mut buf = samples_for_cb.lock();
-                    buf.extend(data.iter().map(|&s| {
-                        (s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0)
-                    }));
+                    let start = buf.len();
+                    buf.extend(
+                        data.iter()
+                            .map(|&s| (s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0)),
+                    );
+                    observe_activity(
+                        &buf[start..],
+                        sample_rate,
+                        channels,
+                        silence_threshold,
+                        &last_voice_for_cb,
+                    );
                 },
                 err_fn,
                 None,
@@ -99,6 +126,7 @@ impl Recorder {
         stream.play().context("stream play")?;
 
         Ok(Self {
+            last_voice,
             _stream: stream,
             samples,
             sample_rate,
@@ -110,6 +138,7 @@ impl Recorder {
     /// 只帶 samples buffer + 格式,不帶 cpal Stream(那個不是 Sync,跨執行緒不好搬)。
     pub fn buffer(&self) -> BufferHandle {
         BufferHandle {
+            last_voice: self.last_voice.clone(),
             samples: self.samples.clone(),
             sample_rate: self.sample_rate,
             channels: self.channels,
@@ -128,6 +157,7 @@ impl Recorder {
             sample_rate,
             channels,
             _stream,
+            ..
         } = self;
         drop(_stream);
 
@@ -140,6 +170,7 @@ impl Recorder {
 /// 累積的部分整段取走編成 WAV(取走之後錄音繼續,新的 samples 從頭累積)。
 #[derive(Clone)]
 pub struct BufferHandle {
+    last_voice: Arc<Mutex<std::time::Instant>>,
     samples: Arc<Mutex<Vec<f32>>>,
     sample_rate: u32,
     channels: u16,
@@ -149,10 +180,20 @@ impl BufferHandle {
     /// 測試用:直接從 samples 造一個把手,不需要真的 audio device。
     #[cfg(test)]
     fn from_samples(samples: Vec<f32>, sample_rate: u32, channels: u16) -> Self {
-        Self { samples: Arc::new(Mutex::new(samples)), sample_rate, channels }
+        Self {
+            samples: Arc::new(Mutex::new(samples)),
+            sample_rate,
+            channels,
+            last_voice: Arc::new(Mutex::new(std::time::Instant::now())),
+        }
+    }
+
+    pub fn silence_elapsed(&self) -> std::time::Duration {
+        self.last_voice.lock().elapsed()
     }
 
     /// 目前累積了幾秒。
+    #[cfg(test)]
     pub fn secs_buffered(&self) -> f32 {
         let n = self.samples.lock().len();
         n as f32 / (self.sample_rate as f32 * self.channels as f32)
@@ -160,16 +201,44 @@ impl BufferHandle {
 
     /// 最後 `tail_ms` 毫秒是不是都低於門檻(= 講話停頓了)。
     /// 累積不足 `tail_ms` 一律回 false,避免一開始就被判成停頓。
+    #[cfg(test)]
     pub fn tail_is_silent(&self, tail_ms: u32, threshold: f32) -> bool {
+        self.silent_tail(&self.samples.lock(), tail_ms, threshold)
+    }
+
+    fn silent_tail(&self, buf: &[f32], tail_ms: u32, threshold: f32) -> bool {
         let want = (self.sample_rate as usize * self.channels as usize) * tail_ms as usize / 1000;
-        let buf = self.samples.lock();
         if want == 0 || buf.len() < want {
             return false;
         }
-        frame_rms(&buf[buf.len() - want..]) < threshold
+        let frame = ((self.sample_rate as usize * FRAME_MS as usize / 1000).max(1))
+            * self.channels as usize;
+        buf[buf.len() - want..]
+            .chunks(frame)
+            .all(|samples| frame_rms(samples) < threshold)
+    }
+
+    /// Check and drain under the same lock, so a resumed word cannot enter between them.
+    pub fn take_after_pause(
+        &self,
+        min_ms: u32,
+        pause_ms: u32,
+        threshold: f32,
+        trim: &TrimConfig,
+    ) -> Option<(Vec<u8>, Encoded)> {
+        let raw = {
+            let mut buf = self.samples.lock();
+            let min_samples = self.sample_rate as u64 * self.channels as u64 * min_ms as u64 / 1000;
+            if (buf.len() as u64) < min_samples || !self.silent_tail(&buf, pause_ms, threshold) {
+                return None;
+            }
+            std::mem::take(&mut *buf)
+        };
+        encode(raw, self.sample_rate, self.channels, trim).ok()
     }
 
     /// 把目前累積的 samples 整段取走並編成 WAV,錄音繼續。沒東西可取回 None。
+    #[cfg(test)]
     pub fn take_wav(&self, trim: &TrimConfig) -> Option<(Vec<u8>, Encoded)> {
         let raw = std::mem::take(&mut *self.samples.lock());
         encode(raw, self.sample_rate, self.channels, trim).ok()
@@ -195,7 +264,12 @@ pub struct Encoded {
 ///
 /// `rms_db` / `duration_secs` 用**整段(剪裁前)**算,維持既有 skip 守門的行為;
 /// 實際編進 WAV 的是**剪裁後**的 samples,長度另外回在 `speech_secs`。
-fn encode(raw: Vec<f32>, sample_rate: u32, channels: u16, trim: &TrimConfig) -> Result<(Vec<u8>, Encoded)> {
+fn encode(
+    raw: Vec<f32>,
+    sample_rate: u32,
+    channels: u16,
+    trim: &TrimConfig,
+) -> Result<(Vec<u8>, Encoded)> {
     if raw.is_empty() {
         anyhow::bail!("錄到 0 samples");
     }
@@ -253,6 +327,34 @@ fn encode(raw: Vec<f32>, sample_rate: u32, channels: u16, trim: &TrimConfig) -> 
 }
 
 /// 單一視窗的 RMS(線性,0~1)。空 → 0。
+fn observe_activity(
+    data: &[f32],
+    rate: u32,
+    channels: u16,
+    threshold: f32,
+    last_voice: &Arc<Mutex<std::time::Instant>>,
+) {
+    // The native VAD is !Send: construct and retain it on the capture thread.
+    // Weak identity prevents state leaking between recording sessions.
+    thread_local! {
+        static DETECTOR: std::cell::RefCell<Option<(std::sync::Weak<Mutex<std::time::Instant>>, crate::voice_activity::Detector)>> = const { std::cell::RefCell::new(None) };
+    }
+    let active = DETECTOR.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let identity = Arc::downgrade(last_voice);
+        if !state.as_ref().is_some_and(|(key, _)| key.ptr_eq(&identity)) {
+            *state = Some((
+                identity,
+                crate::voice_activity::Detector::new(rate, channels),
+            ));
+        }
+        state.as_mut().unwrap().1.observe(data, threshold)
+    });
+    if active {
+        *last_voice.lock() = std::time::Instant::now();
+    }
+}
+
 fn frame_rms(seg: &[f32]) -> f32 {
     if seg.is_empty() {
         return 0.0;
@@ -363,6 +465,36 @@ fn drop_internal_runs(
 mod tests {
     use super::*;
 
+    #[test]
+    fn idle_clock_survives_chunk_drains_and_resets_only_on_sound() {
+        let h = BufferHandle::from_samples(vec![0.0; SR as usize * 3], SR, 1);
+        *h.last_voice.lock() = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        observe_activity(&vec![0.001; SR as usize / 10], SR, 1, 0.008, &h.last_voice);
+        assert!(h.silence_elapsed().as_secs() >= 60);
+        h.take_after_pause(2500, 1200, 0.008, &TrimConfig::default())
+            .unwrap();
+        assert!(
+            h.silence_elapsed().as_secs() >= 60,
+            "draining silent chunks must not restart the idle clock"
+        );
+        observe_activity(&vec![0.05; SR as usize / 50], SR, 1, 0.008, &h.last_voice);
+        assert!(
+            h.silence_elapsed().as_secs() >= 60,
+            "a brief noise must not restart idle"
+        );
+        let wav = include_bytes!("../assets/voices/local.wav");
+        let mut reader = hound::WavReader::new(std::io::Cursor::new(wav)).unwrap();
+        let rate = reader.spec().sample_rate;
+        let voice: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        let h = BufferHandle::from_samples(Vec::new(), rate, 1);
+        *h.last_voice.lock() = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        observe_activity(&voice, rate, 1, 0.008, &h.last_voice);
+        assert!(h.silence_elapsed() < std::time::Duration::from_secs(1));
+    }
+
     const SR: u32 = 16_000;
 
     fn silence(secs: f32) -> Vec<f32> {
@@ -431,7 +563,9 @@ mod tests {
     /// 造 `ms` 毫秒的訊號,振幅 `amp`(0 = 靜音)。
     fn buf_tone(ms: u32, amp: f32) -> Vec<f32> {
         let n = (SR as usize) * ms as usize / 1000;
-        (0..n).map(|i| if i % 2 == 0 { amp } else { -amp }).collect()
+        (0..n)
+            .map(|i| if i % 2 == 0 { amp } else { -amp })
+            .collect()
     }
 
     #[test]
@@ -449,7 +583,54 @@ mod tests {
         samples.extend(buf_tone(800, 0.0)); // 講完之後停 800ms
         let h = BufferHandle::from_samples(samples, SR, 1);
         assert!(h.tail_is_silent(700, 0.02), "尾巴 800ms 靜音應該判成停頓");
-        assert!(!h.tail_is_silent(1200, 0.02), "看回 1200ms 會吃到人聲,不算停頓");
+        assert!(
+            !h.tail_is_silent(1200, 0.02),
+            "看回 1200ms 會吃到人聲,不算停頓"
+        );
+    }
+
+    #[test]
+    fn pause_drain_waits_for_resumed_speech_and_preserves_samples() {
+        for channels in [1, 2] {
+            let mut raw = buf_tone(2000, 0.05);
+            raw.extend(buf_tone(1200, 0.0));
+            let raw: Vec<_> = raw
+                .iter()
+                .flat_map(|x| std::iter::repeat_n(*x, channels as usize))
+                .collect();
+            let h = BufferHandle::from_samples(raw, SR, channels);
+            assert!(h.tail_is_silent(1200, 0.008));
+            // Audio callback receives a new syllable after an earlier silence check.
+            h.samples
+                .lock()
+                .extend(vec![0.05; SR as usize / 50 * channels as usize]);
+            let before = h.samples.lock().len();
+            let trim = TrimConfig {
+                enabled: false,
+                ..TrimConfig::default()
+            };
+            assert!(h.take_after_pause(2500, 1200, 0.008, &trim).is_none());
+            assert_eq!(h.samples.lock().len(), before);
+            h.samples
+                .lock()
+                .extend(vec![0.0; SR as usize * 1200 / 1000 * channels as usize]);
+            let expected_secs = h.secs_buffered();
+            let (_, enc) = h.take_after_pause(2500, 1200, 0.008, &trim).unwrap();
+            assert!((enc.duration_secs - expected_secs).abs() < 0.001);
+            assert!(h.samples.lock().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_short_word_inside_the_pause_window_is_not_silence() {
+        let mut samples = vec![0.0; SR as usize * 2];
+        let end = samples.len();
+        samples[end - SR as usize / 50..].fill(0.08);
+        let h = BufferHandle::from_samples(samples, SR, 1);
+        assert!(
+            !h.tail_is_silent(700, 0.02),
+            "20ms of speech must not be averaged away by 680ms silence"
+        );
     }
 
     #[test]
@@ -495,7 +676,11 @@ mod tests {
             "duration 用整段(剪裁前)算,應該 2.3 秒左右,實際 {}",
             enc.duration_secs
         );
-        assert!(enc.rms_db > -45.0, "有人聲,不該被當成靜音,實際 {}", enc.rms_db);
+        assert!(
+            enc.rms_db > -45.0,
+            "有人聲,不該被當成靜音,實際 {}",
+            enc.rms_db
+        );
         assert!(
             enc.speech_secs > 1.2 && enc.speech_secs < 1.8,
             "剪掉尾巴 800ms 靜音後應該剩 1.5 秒左右,實際 {}",

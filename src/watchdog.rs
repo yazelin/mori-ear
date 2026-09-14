@@ -93,6 +93,9 @@ mod tests {
         let r = guard(Duration::from_secs(1), "slow", slow).await;
         let msg = r.unwrap_err().to_string();
         assert!(msg.contains("逾時"), "應回逾時錯: {msg}");
-        assert!(msg.contains("transcribe_timeout_secs"), "錯訊應指路設定: {msg}");
+        assert!(
+            msg.contains("transcribe_timeout_secs"),
+            "錯訊應指路設定: {msg}"
+        );
     }
 }

@@ -77,7 +77,7 @@ impl Live {
         let Some(stdin) = self.child.stdin.as_mut() else {
             return;
         };
-        let _ = write!(stdin, "{text}\n");
+        let _ = writeln!(stdin, "{text}");
         let _ = stdin.flush();
     }
 }

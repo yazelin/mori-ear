@@ -4,3 +4,6 @@ Cargo.lock.bak
 
 # exchange workstream 標記,本機用,不進 repo(其他 mori repo 也都沒收)
 .exchange
+
+# 本機程式架構索引；不放進原始碼套件。
+.understand-anything/

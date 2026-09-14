@@ -143,7 +143,7 @@ fn respond_inference(mut req: Request, handle: &tokio::runtime::Handle, params: 
         let backend = form
             .text("backend")
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| params.backend.clone());
+            .unwrap_or_else(|| crate::mode_command::current(&params.backend));
         let request_prompt = form.text("prompt");
         // cleanup 欄位:false/0/raw/none → 跳過 cleanup;有給其他值 → 做;沒給 → 用預設。
         let skip_cleanup = match form.text("cleanup").as_deref() {

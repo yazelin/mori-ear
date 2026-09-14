@@ -190,6 +190,8 @@ pause produces a segment that is almost entirely silence.
 
 ### 講到一半就先送(`voice_input.stream_chunks_*`)
 
+Pause detection checks every 20 ms interleaved frame, not RMS averaged over the whole pause window. A brief resumed syllable must invalidate silence. `BufferHandle::take_after_pause` checks minimum duration, validates silence and drains under one lock; do not split those operations across audio callbacks. Defaults remain unchanged; per-user thresholds and pause duration can be tuned in `ear.json`.
+
 按住 / toggle 期間背景偵測停頓(尾巴靜音 `stream_pause_ms` 且已累積 `stream_min_segment_ms`),
 切一段就丟去轉譯 + cleanup。放開時只剩尾巴要跑。實測放開到貼回從 0.9–1.4s 降到 0.75s。
 
@@ -207,6 +209,8 @@ Internal-pause removal is intentionally conservative (only ≥300ms) so Whisper 
 
 ## What to NOT do
 
+User-authorized exception (2026-09-14): a standalone Linux mode picker (`--settings` / `ear settings`) using yad. It must reuse the atomic backend update, run independently of the recording daemon, and never restart or stop capture when selecting a mode. This request supersedes the no-GUI restriction only for this focused settings window.
+
 - Do not add a tray icon or a persistent GUI to mori-ear. That's mori-desktop's job.
   **One deliberate exception (2026-08-26, yazelin's call):** the transient preview /
   confirm windows in `src/preview.rs`. They spawn `yad` the same way paste-back spawns
@@ -216,6 +220,20 @@ Internal-pause removal is intentionally conservative (only ≥300ms) so Whisper 
 - Do not add a feature toggle for "skip cleanup" to ear.json beyond the existing `raw` flag — the cleanup LLM is the difference between "謝謝你訂閱頻道" hallucinations and clean繁中.
 - Do not introduce a tokio task that polls `GlobalHotKeyEvent::receiver()` on a tokio worker on Windows. See gotcha above.
 - Do not auto-update `~/.mori/config.json` from mori-ear. That file is mori-desktop's source of truth; mori-ear is a read-only consumer of `providers.groq.api_key`.
+
+## Voice mode commands
+
+Online/線上 maps to Groq, offline/離線 maps to local. Unknown 現場 must not be guessed. `status_after_cleanup` can recover only `Status` from a cleaned short question; it must never return a `Switch`. Raw text remains the only authority for configuration mutation.
+
+`voice_input.idle_silence_secs` (default 0) is independent of the total recording limit. Capture callbacks use thread-local WebRTC VAD (not Send), keyed by a weak per-session identity. At least 200 ms voiced/above-threshold frames in the trailing 500 ms confirms activity. Draining chunks never resets this clock. The monitor runs even when streaming is disabled. Hotkey STT also gates WAVs through VAD; this does not change trimming or HTTP/batch behavior. Background speech and speaker feedback can still reset idle; no echo cancellation is provided.
+
+Streaming commands execute in speech order while capture continues. They never signal stop. A separate bounded feedback worker serializes notification/audio playback without blocking capture or subsequent dictation. `toggle_max_secs: 0` disables the recording limit. There is no acoustic echo cancellation; do not claim simultaneous speaker output cannot enter the microphone.
+
+Short status questions can omit the name (including 「什麼模式？」). Mutating switch commands still require a supported Mori alias. Choose the longest matching alias, so Mori does not consume the start of Moris; Morris and Maurice are observed ASR variants. Reject quoted, negated and extended dictation.
+
+`mode_command.rs` recognizes short utterances from raw hotkey STT, before cleanup. Keep commands typed as `Segment::Command`, separate from `Segment::Dictation`: cleanup output must never acquire command authority. Streaming tasks execute commands through `Pipeline::respond_to_command` and consume them, so stop() cannot repeat them. Manual-stop tail commands use the same response queue. `FinishGuard` prevents a new recording session while a manually stopped session finishes transcription, but does not cover queued playback. Batch and HTTP are transcription-only.
+
+`mode_commands.{enabled,sound,notification}` default to true and are read live. Mode changes atomically patch only `ear.json.backend`; malformed JSON and missing Groq keys must leave the original file intact. Hotkey segments and HTTP requests without explicit backend overrides read the current backend each time. `mode_voice.rs` plays bundled 16-bit PCM WAV using cpal, with per-file overrides in `~/.mori/mori-ear/voices`. Desktop notifications currently use Linux `notify-send`; failures must not undo a successful mode change.
 
 ## Linked organs
 

@@ -1,13 +1,15 @@
 [package]
 name = "mori-ear"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "Mori 的耳朵 — 極簡 CLI:全域熱鍵 → 錄音 → STT → stdout"
+repository = "https://github.com/yazelin/mori-ear"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 # audio capture
 cpal = "0.15"
+webrtc-vad = "0.4"
 # WAV encoding (Groq Whisper 收 wav/mp3/flac 等,wav 最簡)
 hound = "3.5"
 # Groq Whisper API
@@ -27,6 +29,7 @@ single-instance = "0.3"
 # JSON
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 # error + log
 anyhow = "1"
 tracing = "0.1"

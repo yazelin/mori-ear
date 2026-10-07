@@ -36,6 +36,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # parking_lot for low-overhead mutex(audio callback path)
 parking_lot = "0.12"
+zhconv = "0.4.2"
 
 # Linux-only:close fd 3..N 在 spawn child 前(pre_exec hook)。
 # 為什麼:`single-instance` crate 創 abstract Unix socket 時沒設 FD_CLOEXEC,

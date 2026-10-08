@@ -635,6 +635,23 @@ pub(crate) async fn transcribe_with_fallback(
     initial_prompt: Option<&str>,
     wav: Vec<u8>,
 ) -> Result<String> {
+    let text = stt_raw(backend, api_key, language, initial_prompt, wav).await?;
+    Ok(if language.starts_with("zh") { to_zh_tw(&text) } else { text })
+}
+
+/// Whisper(尤其 Groq 雲端)language=zh 常吐簡體;在 STT 出口統一轉台灣正體,
+/// 不靠 cleanup LLM 聽話(desktop 整合模式根本不跑 ear 的 cleanup)。
+pub(crate) fn to_zh_tw(text: &str) -> String {
+    zhconv::zhconv(text, zhconv::Variant::ZhTW)
+}
+
+async fn stt_raw(
+    backend: &str,
+    api_key: Option<&str>,
+    language: &str,
+    initial_prompt: Option<&str>,
+    wav: Vec<u8>,
+) -> Result<String> {
     match backend {
         "groq" => {
             let key = api_key.context("backend=groq 但無 Groq API key")?;
@@ -1086,23 +1103,33 @@ fn paste_back_wayland(text: &str, paste_key: &str) -> anyhow::Result<()> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
-    // 1. wl-copy 寫 Wayland clipboard
-    let mut copy_cmd = Command::new("wl-copy");
-    copy_cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = pre_exec_close_fds(&mut copy_cmd)
-        .spawn()
-        .context("spawn wl-copy — 沒裝?`sudo apt install wl-clipboard ydotool`")?;
-    {
-        let stdin = child.stdin.as_mut().context("get wl-copy stdin")?;
-        stdin
-            .write_all(text.as_bytes())
-            .context("write to wl-copy")?;
-    }
-    // wl-copy 跟 xclip 一樣 fork 成 daemon 守著 selection,不 wait(會卡)。
-    drop(child);
+    // 1. 寫 clipboard:先用 xclip 寫 X11 CLIPBOARD,Mutter 會同步到 Wayland。
+    //    直接用 wl-copy 在 GNOME 50 會跳「未知 wl-clipboard 要求貼上」權限對話框,
+    //    每次都要按允許(mori-desktop 5F 同一招)。沒裝 xclip 才退 wl-copy。
+    let tool = ["xclip", "wl-copy"]
+        .into_iter()
+        .find_map(|tool| {
+            let mut cmd = Command::new(tool);
+            if tool == "xclip" {
+                cmd.args(["-selection", "clipboard"]);
+            }
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = pre_exec_close_fds(&mut cmd).spawn().ok()?;
+            let wrote = child
+                .stdin
+                .take()
+                .map(|mut stdin| stdin.write_all(text.as_bytes()).is_ok())
+                .unwrap_or(false);
+            // 兩者都會 fork 成 daemon 守 selection;前景那層很快就結束,
+            // 背景 wait 收屍,不然每貼一次留一個 <defunct>。
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            wrote.then_some(tool)
+        })
+        .context("寫 clipboard 失敗 — 沒裝?`sudo apt install xclip ydotool`")?;
 
     std::thread::sleep(std::time::Duration::from_millis(60));
 
@@ -1134,7 +1161,7 @@ fn paste_back_wayland(text: &str, paste_key: &str) -> anyhow::Result<()> {
         );
     }
 
-    tracing::info!(paste_key, "paste-back via wl-copy + ydotool (Wayland)");
+    tracing::info!(paste_key, clipboard = tool, "paste-back via clipboard + ydotool (Wayland)");
     Ok(())
 }
 
@@ -1977,6 +2004,12 @@ async fn handle_event(session: Session, toggle_max_secs: u64) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stt_output_becomes_taiwan_traditional() {
+        assert_eq!(super::to_zh_tw("他一直出现什么WL Clip"), "他一直出現什麼WL Clip");
+        assert_eq!(super::to_zh_tw("这个软件后面再说"), "這個軟體後面再說");
+        assert_eq!(super::to_zh_tw("已經是正體"), "已經是正體");
+    }
     use super::*;
 
     #[tokio::test]

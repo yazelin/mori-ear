@@ -26,7 +26,7 @@
 #
 # paste-back 依賴依 session 分兩組,`install` / `status` / `deps` 會自動判斷:
 #   X11     — xclip + xdotool
-#   Wayland — wl-clipboard + ydotool,且 ydotoold 要在跑、使用者要在 input 群組
+#   Wayland — xclip(或 wl-clipboard)+ ydotool,且 ydotoold 要在跑、使用者要在 input 群組
 # 熱鍵來源不分 session:X11 / Wayland 都靠 GNOME 快捷鍵送 SIGUSR1 給跑著的 daemon。
 
 set -u
@@ -192,7 +192,7 @@ check_deps() {
     local missing=() hints=() ok=1
     if is_wayland; then
         echo "  session:   Wayland(熱鍵走 GNOME 快捷鍵 → ear talk)"
-        command -v wl-copy  >/dev/null 2>&1 || { missing+=("wl-clipboard"); ok=0; }
+        command -v xclip >/dev/null 2>&1 || command -v wl-copy >/dev/null 2>&1 || { missing+=("xclip"); ok=0; }
         command -v ydotool  >/dev/null 2>&1 || { missing+=("ydotool");      ok=0; }
         if command -v ydotool >/dev/null 2>&1; then
             if ! systemctl --user is-active --quiet ydotool 2>/dev/null; then

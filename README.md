@@ -101,7 +101,7 @@ export GROQ_API_KEY=gsk_xxxxx
 #    另外選用:sudo apt install yad，關掉 live_paste 時的懸浮預覽 / 長句編輯視窗
 #    (缺了只是沒有那個視窗,轉錄與貼回照常)
 sudo apt install xclip xdotool                 # X11
-sudo apt install wl-clipboard ydotool          # Wayland
+sudo apt install xclip ydotool                  # Wayland(沒有 xclip 才用 wl-clipboard)
 sudo systemctl --user enable --now ydotool     # Wayland:paste-back 靠這個 daemon
 sudo usermod -aG input "$USER"                 # Wayland:加完必須重新登入才生效
 
@@ -132,7 +132,7 @@ install -m 755 install-autostart.sh ~/.local/bin/
 #    - 系統依賴(以 Ubuntu / Debian 為例;其他發行版自行對應)
 sudo apt install pkg-config libasound2-dev libx11-dev xclip xdotool
 #      Wayland 另外要(X11 session 可略):
-sudo apt install wl-clipboard ydotool
+sudo apt install ydotool
 sudo systemctl --user enable --now ydotool     # paste-back 靠這個 daemon
 sudo usermod -aG input "$USER"                 # ydotool 要 /dev/uinput,加完要重新登入
 
@@ -203,7 +203,7 @@ paste-back 的外部依賴依 session 分兩組，`ear deps` 會自己判斷該�
 | session | 需要 | 額外條件 |
 |---|---|---|
 | **X11** | `xclip` + `xdotool` | — |
-| **Wayland** | `wl-clipboard` + `ydotool` | `ydotoold` 服務要在跑、使用者要在 `input` 群組(加完**必須重新登入**) |
+| **Wayland** | `xclip`(或 `wl-clipboard`)+ `ydotool` | `ydotoold` 服務要在跑、使用者要在 `input` 群組(加完**必須重新登入**) |
 
 預設快捷鍵 `<Ctrl><Alt>e` → `ear talk`(送 SIGUSR1 給 daemon = 一次「按下」)，要換改 `scripts/ear.sh` 頂端 `GS_BINDING` 後重跑 `ear keybind off && ear keybind on`。
 
@@ -381,7 +381,7 @@ Whisper 對安靜的音訊會幻覺出「謝謝」「請訂閱」「祝你生日
 - `groq_api_key`：留空時 fallback 去 `~/.mori/config.json` 的 `providers.groq.api_key`(跟 mori-desktop 共用)，再 fallback 環境變數 `GROQ_API_KEY`。
 - `backend`：STT 後端 `auto`(預設) / `groq`(只雲端) / `local`(只本機、音檔不離機)。`auto` 本機優先，本機不行才 Groq。**本機隨需自啟**：`local` / `auto` 要用本機 whisper-server 但它沒在跑時，mori-ear 會用 `~/.mori/bin/mori-whisper-serve --ensure` 把它叫醒(冪等)，等它 ready(≤15s)再用；裝了那支 supervisor 才有，沒有就 fallback Groq(`auto`)或報錯(`local`)。沒人用滿 10 分鐘，server 自己關。
 - `language`:空 = 自動偵測。`zh` / `en` / 其他 ISO 639-1。
-- `raw`：`true` = 跳過 cleanup LLM，直接送 raw Whisper 輸出(省 ~200ms 跟一輪 token，但會有錯字 / 簡體)。
+- `raw`：`true` = 跳過 cleanup LLM，直接送 raw Whisper 輸出(省 ~200ms 跟一輪 token，但會有錯字；簡體一律在 STT 出口轉成台灣正體，`language` 是 `zh` 開頭時)。
 - `cleanup_prompt_file`：cleanup LLM 的 system prompt 來源 `.md` / `.txt` 路徑(支援 `~/`)。空 / 檔不存在 → fallback 內建 prompt。**每次 cleanup live-read**，改 prompt 不必重啟 mori-ear。指向 `~/.mori/voice_input/USER-00.純文字輸入.md` 可跟 mori-desktop 共用同一份。
 - `stt_initial_prompt_file`：Whisper/Groq STT initial prompt 來源 `.md` / `.txt` 路徑(支援 `~/`)。空時依序讀 `~/.mori/mori-ear/stt-initial-prompt.md`、`~/.mori/stt/initial-prompt.md`。這是**轉錄 decoder context**(專有名詞 / 繁中 / 台灣用語 bias)，不是 cleanup LLM system prompt；每次轉錄前 live-read，改檔不用重啟 mori-ear。HTTP `/inference` 也可用 multipart 欄位 `prompt` 臨時覆寫。
 - `paste_back`：`true`(預設) = 同時印 stdout + 貼進焦點視窗；`false` = 只印 stdout，不碰 clipboard、不按 Ctrl+V。pipe 用法 / headless / 不想干擾焦點視窗時設 `false`。
@@ -515,7 +515,7 @@ sudo modprobe uinput && sudo udevadm control --reload && sudo udevadm trigger
 
 - **`~/.mori/ear.json` 的 `hotkey` 欄位在 Linux 沒有作用**。實際綁哪一組鍵由桌面環境決定，改 `scripts/ear.sh` 頂端的 `GS_BINDING` 再 `ear keybind off && ear keybind on`，或直接去「設定 → 鍵盤 → 檢視及自訂快捷鍵」改。
 - **偵測不到 terminal**。Wayland 不讓 client 查焦點視窗，所以自動 Ctrl+V / Ctrl+Shift+V 切換在這裡失效。terminal 使用者請設 `paste_key`。
-- **paste-back 靠 `ydotool`**。`wl-copy` 寫 clipboard、`ydotool` 透過 `/dev/uinput` 造虛擬鍵盤注入按鍵(所以任何視窗都吃)。`/dev/uinput` 開不了或 `ydotoold`(1.x 才有)沒跑就會失敗，失敗時自動退回 XWayland 那條(`xclip`+`xdotool`，只對 X11 視窗有效)。
+- **paste-back 靠 `ydotool`**。`xclip` 寫 X11 clipboard(Mutter 會同步到 Wayland;直接用 `wl-copy` 在 GNOME 50 會每次跳「未知 wl-clipboard 要求貼上」的權限對話框，所以只在沒裝 xclip 時才用)、`ydotool` 透過 `/dev/uinput` 造虛擬鍵盤注入按鍵(所以任何視窗都吃)。`/dev/uinput` 開不了或 `ydotoold`(1.x 才有)沒跑就會失敗，失敗時自動退回 XWayland 那條(`xclip`+`xdotool`，只對 X11 視窗有效)。
 
 範例 pipe(轉錄寫到剪貼簿 + 自己 echo):
 
